@@ -18,11 +18,16 @@ function getTimeCategory(): string {
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:3001'
 
+function fixSrc(track: Track): Track {
+  return { ...track, src: track.src.replace(/^https?:\/\/[^/]+/, API_BASE) }
+}
+
 async function loadTracks(category?: string): Promise<Track[]> {
   const cat = category ?? getTimeCategory()
   const res = await fetch(`${API_BASE}/tracks?category=${cat}`)
   if (!res.ok) throw new Error(`Server error: ${res.status}`)
-  return res.json()
+  const tracks: Track[] = await res.json()
+  return tracks.map(fixSrc)
 }
 
 export function usePlayer() {

@@ -17,7 +17,15 @@ export function useLibrary() {
   useEffect(() => {
     fetch(`${API_BASE}/library`)
       .then(r => { if (!r.ok) throw new Error(`Server ${r.status}`); return r.json() })
-      .then((data: Library) => { setLibrary(data); setLoading(false) })
+      .then((data: Library) => {
+        const fix = (t: Track) => ({ ...t, src: t.src.replace(/^https?:\/\/[^/]+/, API_BASE) })
+        setLibrary({
+          morning: data.morning.map(fix),
+          day:     data.day.map(fix),
+          evening: data.evening.map(fix),
+        })
+        setLoading(false)
+      })
       .catch(e => { setError(String(e)); setLoading(false) })
   }, [])
 
