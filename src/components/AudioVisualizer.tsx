@@ -62,8 +62,9 @@ export default function AudioVisualizer({ audioRef, isPlaying }: Props) {
     canvas.width = canvas.clientWidth || 560
     canvas.height = 90
 
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return
+    const ctxRaw = canvas.getContext('2d')
+    if (!ctxRaw) return
+    const ctx: CanvasRenderingContext2D = ctxRaw
 
     const W = canvas.width
     const H = canvas.height
