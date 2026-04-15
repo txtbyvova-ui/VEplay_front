@@ -33,10 +33,10 @@ const COVERS = [
 
 type Category = 'morning' | 'day' | 'evening'
 
-const CAT: Record<Category, { label: string; emoji: string }> = {
-  morning: { label: 'Morning', emoji: '🌙' },
-  day:     { label: 'Day',     emoji: '☀️'  },
-  evening: { label: 'Evening', emoji: '🌅' },
+const CAT: Record<Category, { label: string }> = {
+  morning: { label: 'Morning' },
+  day:     { label: 'Day'     },
+  evening: { label: 'Evening' },
 }
 
 function fmt(s: number): string {
@@ -45,6 +45,49 @@ function fmt(s: number): string {
 }
 
 function randCover() { return COVERS[Math.floor(Math.random() * COVERS.length)] }
+
+function MoonIcon({ size = 20, stroke = 'rgba(255,255,255,0.7)' }: { size?: number; stroke?: string }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={stroke} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+    </svg>
+  )
+}
+function SunIcon({ size = 20, stroke = 'rgba(255,255,255,0.7)' }: { size?: number; stroke?: string }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={stroke} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="5"/>
+      <line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/>
+      <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+      <line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/>
+      <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+    </svg>
+  )
+}
+function SunsetIcon({ size = 20, stroke = 'rgba(255,255,255,0.7)' }: { size?: number; stroke?: string }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={stroke} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M17 18a5 5 0 0 0-10 0"/>
+      <line x1="12" y1="9" x2="12" y2="2"/>
+      <line x1="4.22" y1="10.22" x2="5.64" y2="11.64"/>
+      <line x1="1" y1="18" x2="23" y2="18"/>
+      <line x1="18.36" y1="11.64" x2="19.78" y2="10.22"/>
+    </svg>
+  )
+}
+function SpeakerIcon({ size = 18, stroke = 'rgba(255,255,255,0.7)' }: { size?: number; stroke?: string }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={stroke} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+      <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+    </svg>
+  )
+}
+const CAT_ICONS = { morning: MoonIcon, day: SunIcon, evening: SunsetIcon }
+function CatIcon({ cat, size, stroke }: { cat: Category; size?: number; stroke?: string }) {
+  const Icon = CAT_ICONS[cat]
+  return <Icon size={size} stroke={stroke} />
+}
 
 export default function PlayerScreen() {
   const {
@@ -148,21 +191,9 @@ export default function PlayerScreen() {
           width: '45%', flexShrink: 0, position: 'relative',
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           overflow: 'hidden',
+          background: 'linear-gradient(135deg, #0f0f0f 0%, #1c1c1c 50%, #0d0d0d 100%)',
         }}
       >
-        {/* Blurred ambient background */}
-        <div
-          style={{
-            position: 'absolute', inset: 0,
-            backgroundImage: `url(${cover})`,
-            backgroundSize: 'cover', backgroundPosition: 'center',
-            filter: 'blur(48px) brightness(0.25)',
-            transform: 'scale(1.3)',
-            opacity: coverOpacity,
-            transition: 'opacity 300ms ease',
-          }}
-        />
-
         {/* Spinning vinyl */}
         <div
           className="player-cover-wrapper"
@@ -223,12 +254,12 @@ export default function PlayerScreen() {
 
         {/* Track info */}
         <div style={{ minHeight: 0 }}>
-          <p style={{
-            fontSize: 11, letterSpacing: '0.28em', textTransform: 'uppercase',
-            color: 'rgba(255,255,255,0.28)', marginBottom: 10,
-          }}>
-            {CAT[activeCat].emoji}&nbsp; {CAT[activeCat].label}
-          </p>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10 }}>
+            <CatIcon cat={activeCat} size={14} stroke="rgba(255,255,255,0.28)" />
+            <span style={{ fontSize: 11, letterSpacing: '0.28em', textTransform: 'uppercase', color: 'rgba(255,255,255,0.28)' }}>
+              {CAT[activeCat].label}
+            </span>
+          </div>
           <h1 className="player-title" style={{
             fontSize: 30, fontWeight: 700, color: '#ffffff',
             lineHeight: 1.15, marginBottom: 8,
@@ -282,7 +313,7 @@ export default function PlayerScreen() {
 
         {/* Volume */}
         <div className="player-volume-row" style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <span style={{ fontSize: 18, lineHeight: 1 }}>🔊</span>
+          <SpeakerIcon size={18} stroke="rgba(255,255,255,0.4)" />
           <div
             className="player-volume-wrap"
             style={{ width: 200, height: 48, display: 'flex', alignItems: 'center', cursor: 'pointer', touchAction: 'manipulation' }}
@@ -361,7 +392,7 @@ export default function PlayerScreen() {
                   WebkitTapHighlightColor: 'transparent',
                 }}
               >
-                <span style={{ fontSize: 22, lineHeight: 1 }}>{CAT[cat].emoji}</span>
+                <CatIcon cat={cat} size={20} stroke={active ? 'rgba(255,255,255,1)' : 'rgba(255,255,255,0.4)'} />
                 <span style={{
                   fontSize: 12, fontWeight: active ? 600 : 400,
                   color: active ? '#ffffff' : 'rgba(255,255,255,0.7)',
