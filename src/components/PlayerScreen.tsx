@@ -1,26 +1,19 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { motion, AnimatePresence } from 'framer-motion'
-import { Play, Pause, SkipForward, SpeakerSimpleHigh, SpeakerSimpleLow, SpeakerSimpleNone } from '@phosphor-icons/react'
+import { Play, Pause, SkipForward } from '@phosphor-icons/react'
 import NoiseOverlay from './NoiseOverlay'
-import ClientLibrary from './ClientLibrary'
 import { usePlayer } from '../hooks/usePlayer'
 import { useLibrary } from '../hooks/useLibrary'
 
-const fontMono    = { fontFamily: "'IBM Plex Mono', monospace" }
-const fontDisplay = { fontFamily: "'M PLUS 1', sans-serif" }
-
-const VINYL_COVERS = [
+const COVERS = [
   '/vinyl/030ccb9c4f039102b5ebac6fd7dd02f0.jpg',
   '/vinyl/096f8cc22e45903f005504f7a619bb77.jpg',
   '/vinyl/10a47b7cb24e38542c24d1d7557f2875.jpg',
   '/vinyl/15b63f40a5a71d37e3f8f940f1fcae2c.jpg',
   '/vinyl/16c36fbc665907fac7e1ab5e59f3d34e.jpg',
   '/vinyl/17e6ae811641d4f4f62fad57eaf0a589.jpg',
-  '/vinyl/1975dd76793d2a62756f02f045ac0c80%20(1).jpg',
   '/vinyl/1d372446eb0498073acbe961320e2298.jpg',
   '/vinyl/1de016507a70c5aa9ac8391901eeb648.jpg',
   '/vinyl/249de981c7d09ed7e890111f6d04412a.jpg',
-  '/vinyl/259b0191c50295355fe46f6fd63ac412.jpg',
   '/vinyl/38eec90788cd3cd19cc29d923f51c591.jpg',
   '/vinyl/47fe43189b1117fbccb364b306a39942.jpg',
   '/vinyl/675c93cc17a3758dd32a070bce90e09b.jpg',
@@ -30,322 +23,358 @@ const VINYL_COVERS = [
   '/vinyl/851cd639b1ea5d75575752dfb5dbd00a.jpg',
   '/vinyl/8c7c591087f49a7009c4ee939b8795d0.jpg',
   '/vinyl/8f5a59cbcfb758ff3b804185df83a3f5.jpg',
-  '/vinyl/a38cc7823b4e46addef749f3e71e1cb8_73bd1130-643b-4960-a6bf-68d3e766a342.png',
   '/vinyl/ab9ed7ace2a17d942517b9e884a6b4c4.jpg',
   '/vinyl/bc7f83bb4b7d99071519f7ae508cc056.jpg',
-  '/vinyl/c4b554cccce45efdb63ef4a476956135%20(1).jpg',
   '/vinyl/d49df90834c5226384f732c3f4e95263.jpg',
-  '/vinyl/d6db61d0d0c97f9898535e29f019a608%20(1).jpg',
   '/vinyl/d73d8f2884276e5cf356653d505ea3dd.jpg',
   '/vinyl/d7506bc4a416857fefa8b52c839b2d77.jpg',
   '/vinyl/e7328f457a678182e36bf3d56d66a6fa.jpg',
 ]
 
-const TOD_LABELS: Record<string, string> = { morning: 'MORNING', day: 'DAY', evening: 'EVENING' }
-const IDLE_MS = 30_000
+type Category = 'morning' | 'day' | 'evening'
 
-function formatTime(s: number): string {
-  if (!isFinite(s) || isNaN(s) || s < 0) return '0:00'
-  const m = Math.floor(s / 60)
-  const sec = Math.floor(s % 60)
-  return `${m}:${sec.toString().padStart(2, '0')}`
+const CAT: Record<Category, { label: string; emoji: string }> = {
+  morning: { label: 'Morning', emoji: '🌙' },
+  day:     { label: 'Day',     emoji: '☀️'  },
+  evening: { label: 'Evening', emoji: '🌅' },
 }
 
-type Mode = 'display' | 'control'
+function fmt(s: number): string {
+  if (!isFinite(s) || isNaN(s) || s < 0) return '0:00'
+  return `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`
+}
+
+function randCover() { return COVERS[Math.floor(Math.random() * COVERS.length)] }
 
 export default function PlayerScreen() {
   const {
-    currentTrack,
+    tracks, currentTrack, currentIndex,
     isPlaying, currentTime, duration,
-    loading, togglePlay, next,
-    replaceQueueAndPlay,
+    loading, togglePlay, next, seek, replaceQueueAndPlay,
     volume, setVolume,
   } = usePlayer()
 
   const { library, loading: libLoading } = useLibrary()
 
-  const [mode, setMode]           = useState<Mode>('display')
-  const [time, setTime]           = useState('')
-  const [currentVinyl, setCurrentVinyl] = useState(VINYL_COVERS[0])
-  const volumeRef  = useRef<HTMLDivElement>(null)
-  const idleTimer  = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [activeCat, setActiveCat]     = useState<Category>('day')
+  const [cover, setCover]             = useState(randCover())
+  const [coverOpacity, setCoverOpacity] = useState(1)
 
-  const progress   = duration > 0 ? currentTime / duration : 0
-  const todLabel   = TOD_LABELS[currentTrack?.category ?? 'morning'] ?? ''
+  const swipeX    = useRef<number | null>(null)
+  const progress  = duration > 0 ? currentTime / duration : 0
+  const nextTrack = tracks.length > 0
+    ? tracks[(currentIndex + 1) % tracks.length]
+    : null
 
+  // Crossfade cover on track change
   useEffect(() => {
-    setCurrentVinyl(VINYL_COVERS[Math.floor(Math.random() * VINYL_COVERS.length)])
+    const newCover = randCover()
+    setCoverOpacity(0)
+    const t = setTimeout(() => { setCover(newCover); setCoverOpacity(1) }, 150)
+    return () => clearTimeout(t)
   }, [currentTrack?.id])
 
+  // Keep active category in sync with playing track
   useEffect(() => {
-    const update = () => {
-      const now = new Date()
-      setTime(now.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' }))
-    }
-    update()
-    const id = setInterval(update, 1000)
-    return () => clearInterval(id)
-  }, [])
+    const c = currentTrack?.category
+    if (c === 'morning' || c === 'day' || c === 'evening') setActiveCat(c)
+  }, [currentTrack?.category])
 
-  useEffect(() => () => { if (idleTimer.current) clearTimeout(idleTimer.current) }, [])
+  const switchCategory = useCallback((cat: Category) => {
+    if (libLoading || cat === activeCat) return
+    setActiveCat(cat)
+    const list = library[cat]
+    if (list.length > 0) replaceQueueAndPlay(list, 0)
+  }, [library, libLoading, activeCat, replaceQueueAndPlay])
 
-  const resetIdleTimer = useCallback(() => {
-    if (idleTimer.current) clearTimeout(idleTimer.current)
-    idleTimer.current = setTimeout(() => setMode('display'), IDLE_MS)
-  }, [])
-
-  const handleInteraction = useCallback(() => {
-    setMode(prev => {
-      if (prev === 'display') return 'control'
-      return prev
-    })
-    resetIdleTimer()
-  }, [resetIdleTimer])
-
-  function seekVolume(clientX: number) {
-    if (!volumeRef.current) return
-    const rect = volumeRef.current.getBoundingClientRect()
-    setVolume(Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)))
+  // Progress bar seek — touch
+  function onProgressTouch(e: React.TouchEvent<HTMLDivElement>) {
+    const r = e.currentTarget.getBoundingClientRect()
+    seek(Math.max(0, Math.min(1, (e.touches[0].clientX - r.left) / r.width)))
+  }
+  // Progress bar seek — mouse
+  function onProgressClick(e: React.MouseEvent<HTMLDivElement>) {
+    const r = e.currentTarget.getBoundingClientRect()
+    seek(Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)))
   }
 
-  function onVolumeMouseDown(e: React.MouseEvent) {
-    e.stopPropagation()
-    seekVolume(e.clientX)
-    const onMove = (ev: MouseEvent) => seekVolume(ev.clientX)
-    const onUp   = () => {
-      window.removeEventListener('mousemove', onMove)
-      window.removeEventListener('mouseup', onUp)
-    }
-    window.addEventListener('mousemove', onMove)
-    window.addEventListener('mouseup', onUp)
+  // Volume seek — touch
+  function onVolumeTouch(e: React.TouchEvent<HTMLDivElement>) {
+    const r = e.currentTarget.getBoundingClientRect()
+    setVolume(Math.max(0, Math.min(1, (e.touches[0].clientX - r.left) / r.width)))
+  }
+  // Volume seek — mouse
+  function onVolumeClick(e: React.MouseEvent<HTMLDivElement>) {
+    const r = e.currentTarget.getBoundingClientRect()
+    setVolume(Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)))
   }
 
-  const vinylDisc = (
-    <>
-      <div
-        className="w-full h-full rounded-full border border-[#252525] overflow-hidden"
-        style={{
-          boxShadow: '0 0 60px rgba(0,0,0,0.9), 0 0 120px rgba(0,0,0,0.5)',
-          animation: 'spin 9s linear infinite',
-          animationPlayState: isPlaying ? 'running' : 'paused',
-        }}
-      >
-        <img
-          src={currentVinyl}
-          alt="vinyl"
-          className="w-full h-full object-cover"
-          style={{ filter: 'grayscale(15%) brightness(0.85)' }}
-          draggable={false}
-        />
-      </div>
-      <div
-        className="absolute inset-0 rounded-full pointer-events-none"
-        style={{
-          background: 'repeating-radial-gradient(circle at center, transparent 0, transparent 3px, rgba(0,0,0,0.12) 3px, rgba(0,0,0,0.12) 4px)',
-        }}
-      />
-      <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-4 h-4 rounded-full bg-[#111111] border border-[#252525] z-10" />
-    </>
-  )
+  // Swipe handlers on cover
+  const onSwipeStart = (e: React.TouchEvent) => { swipeX.current = e.touches[0].clientX }
+  const onSwipeEnd   = (e: React.TouchEvent) => {
+    if (swipeX.current === null) return
+    const d = e.changedTouches[0].clientX - swipeX.current
+    swipeX.current = null
+    if (Math.abs(d) < 50) return
+    if (d < 0) next()
+  }
+
+  // Button tap feedback helpers
+  const press   = (e: React.TouchEvent<HTMLButtonElement>) => { e.currentTarget.style.transform = 'scale(0.93)' }
+  const release = (e: React.TouchEvent<HTMLButtonElement>) => { e.currentTarget.style.transform = 'scale(1)' }
+
+  const btnBase: React.CSSProperties = {
+    width: 88, height: 88, borderRadius: '50%', border: 'none',
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+    cursor: 'pointer', flexShrink: 0,
+    transition: 'transform 80ms ease, background 120ms ease',
+    WebkitTapHighlightColor: 'transparent',
+  }
 
   return (
     <div
-      className="h-screen w-screen bg-[#111111] relative overflow-hidden select-none"
-      style={{ maxHeight: '100vh' }}
-      onClick={handleInteraction}
+      className="player-root"
+      style={{
+        display: 'flex', width: '100vw', height: '100vh',
+        background: '#0a0a0a', overflow: 'hidden', position: 'relative',
+      }}
     >
       <NoiseOverlay />
+
+      {/* ── LEFT: Album cover (45%) ── */}
       <div
-        className="fixed inset-0 pointer-events-none z-[9998]"
-        style={{ background: 'radial-gradient(ellipse at center, transparent 50%, rgba(0,0,0,0.5) 100%)' }}
-      />
+        className="player-left"
+        style={{
+          width: '45%', flexShrink: 0, position: 'relative',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          overflow: 'hidden',
+        }}
+      >
+        {/* Blurred ambient background */}
+        <div
+          style={{
+            position: 'absolute', inset: 0,
+            backgroundImage: `url(${cover})`,
+            backgroundSize: 'cover', backgroundPosition: 'center',
+            filter: 'blur(48px) brightness(0.25)',
+            transform: 'scale(1.3)',
+            opacity: coverOpacity,
+            transition: 'opacity 300ms ease',
+          }}
+        />
 
-      {/* ── HEADER — always visible ── */}
-      <header className="absolute top-0 left-0 right-0 px-8 h-10 flex items-center justify-between z-30">
-        <span style={fontMono} className="text-sm tracking-[0.3em]">
-          <span className="text-[#b0b0b0] font-semibold">VE</span>
-          <span className="text-[#3b3b3b]">play</span>
-        </span>
-        <div className="flex items-center gap-2">
-          <div className="w-1.5 h-1.5 rounded-full bg-[#3b3b3b] animate-pulse" />
-          <span style={fontMono} className="text-[10px] tracking-[0.25em] text-[#3b3b3b]">{time}</span>
-        </div>
-      </header>
-
-      <AnimatePresence>
-
-        {/* ══ DISPLAY MODE ══ */}
-        {mode === 'display' && (
-          <motion.div
-            key="display"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            transition={{ duration: 0.3, ease: 'easeInOut' }}
-            className="absolute inset-0 flex flex-col items-center justify-center z-10 cursor-pointer"
-          >
-            {/* Vinyl — big, centered */}
-            <motion.div
-              layoutId="vinyl"
-              className="relative shrink-0"
-              style={{ width: 'min(420px, 52vh)', height: 'min(420px, 52vh)' }}
-              transition={{ duration: 0.35, ease: 'easeInOut' }}
+        {/* Spinning vinyl */}
+        <div
+          className="player-cover-wrapper"
+          style={{ position: 'relative', zIndex: 1, width: 'min(calc(100% - 56px), 420px)', aspectRatio: '1 / 1' }}
+          onTouchStart={onSwipeStart}
+          onTouchEnd={onSwipeEnd}
+        >
+          {/* Spinning disc — border-radius 50% clips to circle */}
+          <div style={{
+            position: 'relative', width: '100%', height: '100%',
+            borderRadius: '50%', overflow: 'hidden',
+            animation: 'spin 8s linear infinite',
+            animationPlayState: isPlaying ? 'running' : 'paused',
+            boxShadow: 'inset 0 0 60px rgba(0,0,0,0.3), 0 0 40px rgba(0,0,0,0.5)',
+          }}>
+            <img
+              src={cover}
+              alt="cover"
+              draggable={false}
+              style={{
+                width: '100%', height: '100%', objectFit: 'cover',
+                display: 'block', opacity: coverOpacity,
+                transition: 'opacity 300ms ease',
+              }}
+            />
+            {/* Vinyl groove lines overlay */}
+            <svg
+              style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none', opacity: 0.18 }}
+              viewBox="0 0 200 200"
             >
-              {vinylDisc}
-            </motion.div>
+              {[18, 28, 38, 48, 58, 68, 76, 84, 90].map(r => (
+                <circle key={r} cx="100" cy="100" r={r} fill="none" stroke="rgba(0,0,0,0.9)" strokeWidth="0.8" />
+              ))}
+            </svg>
+            {/* Depth sheen */}
+            <div style={{
+              position: 'absolute', inset: 0, pointerEvents: 'none',
+              background: 'radial-gradient(circle at 35% 30%, rgba(255,255,255,0.07) 0%, transparent 55%), radial-gradient(circle at center, transparent 65%, rgba(0,0,0,0.35) 100%)',
+            }} />
+          </div>
+          {/* Center spindle */}
+          <div style={{
+            position: 'absolute', top: '50%', left: '50%',
+            transform: 'translate(-50%, -50%)',
+            width: 18, height: 18, borderRadius: '50%',
+            background: '#111', border: '2px solid rgba(255,255,255,0.2)',
+            boxShadow: '0 0 12px rgba(0,0,0,0.9)', zIndex: 2, pointerEvents: 'none',
+          }} />
+        </div>
+      </div>
 
-            {/* Track info */}
-            <div className="text-center mt-10 max-w-[480px]">
-              <p style={fontMono} className="text-[9px] tracking-[0.45em] uppercase text-[#292929] mb-3">NOW PLAYING</p>
-              <h1
-                style={{ ...fontDisplay, fontWeight: 800 }}
-                className="text-[2rem] tracking-tight uppercase text-[#fafafa] leading-none truncate px-4"
-              >
-                {loading ? '···' : (currentTrack?.title ?? 'NO TRACKS')}
-              </h1>
-              <p style={fontMono} className="mt-2 text-[11px] tracking-[0.22em] uppercase text-[#4a4a4a] truncate px-4">
-                {!loading && currentTrack ? currentTrack.artist : ''}
-              </p>
-            </div>
+      {/* ── RIGHT: Controls (55%) ── */}
+      <div className="player-right" style={{
+        flex: 1, display: 'flex', flexDirection: 'column',
+        justifyContent: 'space-between', padding: '28px 36px 28px 32px',
+        overflow: 'hidden',
+      }}>
 
-            {/* TOD indicator — bottom right */}
-            {todLabel && (
-              <div className="absolute bottom-6 right-8">
-                <span style={fontMono} className="text-[8px] tracking-[0.45em] uppercase text-[#252525]">
-                  {todLabel}
-                </span>
-              </div>
-            )}
+        {/* Track info */}
+        <div style={{ minHeight: 0 }}>
+          <p style={{
+            fontSize: 11, letterSpacing: '0.28em', textTransform: 'uppercase',
+            color: 'rgba(255,255,255,0.28)', marginBottom: 10,
+          }}>
+            {CAT[activeCat].emoji}&nbsp; {CAT[activeCat].label}
+          </p>
+          <h1 className="player-title" style={{
+            fontSize: 30, fontWeight: 700, color: '#ffffff',
+            lineHeight: 1.15, marginBottom: 8,
+            overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis',
+          }}>
+            {loading ? '···' : (currentTrack?.title ?? 'No tracks')}
+          </h1>
+          <p className="player-artist" style={{
+            fontSize: 17, color: 'rgba(255,255,255,0.48)',
+            overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis',
+          }}>
+            {!loading && currentTrack ? currentTrack.artist : '\u00A0'}
+          </p>
+        </div>
 
-            {/* Hint — bottom center */}
-            <div className="absolute bottom-6 left-1/2 -translate-x-1/2">
-              <span style={fontMono} className="text-[7px] tracking-[0.35em] uppercase text-[#1c1c1c]">
-                tap to control
-              </span>
-            </div>
-          </motion.div>
-        )}
-
-        {/* ══ CONTROL MODE ══ */}
-        {mode === 'control' && (
-          <motion.div
-            key="control"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            transition={{ duration: 0.3, ease: 'easeInOut' }}
-            className="absolute inset-0 flex z-10"
+        {/* Progress bar */}
+        <div>
+          {/* 48px touch target */}
+          <div
+            style={{ height: 48, display: 'flex', alignItems: 'center', cursor: 'pointer' }}
+            onTouchStart={onProgressTouch}
+            onClick={onProgressClick}
           >
-            {/* LEFT — vinyl mini + big play + progress/volume */}
-            <div className="flex-1 flex flex-col overflow-hidden relative">
+            <div style={{
+              width: '100%', height: 8,
+              background: 'rgba(255,255,255,0.1)', borderRadius: 4, position: 'relative',
+            }}>
+              <div style={{
+                height: '100%', width: `${progress * 100}%`,
+                background: '#ffffff', borderRadius: 4,
+                transition: 'width 0.2s linear',
+              }} />
+              <div style={{
+                position: 'absolute', top: '50%', transform: 'translate(-50%, -50%)',
+                left: `${progress * 100}%`,
+                width: 18, height: 18, borderRadius: '50%',
+                background: '#ffffff', boxShadow: '0 2px 8px rgba(0,0,0,0.4)',
+                pointerEvents: 'none',
+              }} />
+            </div>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 2 }}>
+            <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.32)', fontVariantNumeric: 'tabular-nums', fontFamily: 'monospace' }}>
+              {fmt(currentTime)}
+            </span>
+            <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.32)', fontVariantNumeric: 'tabular-nums', fontFamily: 'monospace' }}>
+              {fmt(duration)}
+            </span>
+          </div>
+        </div>
 
-              {/* Mini vinyl — top left */}
-              <motion.div
-                layoutId="vinyl"
-                className="absolute top-12 left-8 relative shrink-0"
-                style={{ width: 120, height: 120 }}
-                transition={{ duration: 0.35, ease: 'easeInOut' }}
+        {/* Volume */}
+        <div className="player-volume-row" style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span style={{ fontSize: 18, lineHeight: 1 }}>🔊</span>
+          <div
+            className="player-volume-wrap"
+            style={{ width: 200, height: 48, display: 'flex', alignItems: 'center', cursor: 'pointer', touchAction: 'manipulation' }}
+            onTouchStart={onVolumeTouch}
+            onClick={onVolumeClick}
+          >
+            <div style={{ width: '100%', height: 6, background: 'rgba(255,255,255,0.1)', borderRadius: 3, position: 'relative' }}>
+              <div style={{ height: '100%', width: `${volume * 100}%`, background: 'rgba(255,255,255,0.65)', borderRadius: 3, transition: 'width 50ms linear' }} />
+              <div style={{
+                position: 'absolute', top: '50%', transform: 'translate(-50%, -50%)',
+                left: `${volume * 100}%`,
+                width: 14, height: 14, borderRadius: '50%',
+                background: '#fff', pointerEvents: 'none',
+                boxShadow: '0 1px 6px rgba(0,0,0,0.4)',
+              }} />
+            </div>
+          </div>
+        </div>
+
+        {/* Playback controls */}
+        <div>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 20 }}>
+            {/* Play / Pause — main action */}
+            <button
+              className="player-btn-play"
+              style={{ ...btnBase, background: '#ffffff', width: 96, height: 96 }}
+              onClick={togglePlay}
+              onTouchStart={press} onTouchEnd={release}
+            >
+              {isPlaying
+                ? <Pause weight="fill" size={44} color="#0a0a0a" />
+                : <Play  weight="fill" size={44} color="#0a0a0a" />
+              }
+            </button>
+
+            {/* Next */}
+            <button
+              className="player-btn-next"
+              style={{ ...btnBase, background: 'rgba(255,255,255,0.07)' }}
+              onClick={next}
+              onTouchStart={press} onTouchEnd={release}
+            >
+              <SkipForward weight="fill" size={40} color="rgba(255,255,255,0.72)" />
+            </button>
+          </div>
+
+          {/* Next track hint */}
+          <p style={{
+            textAlign: 'center', marginTop: 14,
+            fontSize: 13, color: 'rgba(255,255,255,0.28)',
+            overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis',
+          }}>
+            {nextTrack ? `Следующий: ${nextTrack.title}` : '\u00A0'}
+          </p>
+        </div>
+
+        {/* Playlist switcher */}
+        <div className="player-cats" style={{ display: 'flex', gap: 10 }}>
+          {(['morning', 'day', 'evening'] as Category[]).map(cat => {
+            const active = cat === activeCat
+            return (
+              <button
+                className="player-cat-btn"
+                key={cat}
+                onClick={() => switchCategory(cat)}
+                onTouchStart={press} onTouchEnd={release}
+                style={{
+                  flex: 1, minHeight: 80, borderRadius: 16, border: 'none',
+                  background: active ? 'rgba(255,255,255,0.13)' : 'rgba(255,255,255,0.04)',
+                  outline: active ? '1.5px solid rgba(255,255,255,0.4)' : '1.5px solid rgba(255,255,255,0.07)',
+                  cursor: 'pointer',
+                  display: 'flex', flexDirection: 'column',
+                  alignItems: 'center', justifyContent: 'center', gap: 5,
+                  opacity: active ? 1 : 0.55,
+                  transition: 'background 150ms, opacity 150ms, transform 80ms',
+                  WebkitTapHighlightColor: 'transparent',
+                }}
               >
-                {vinylDisc}
-              </motion.div>
+                <span style={{ fontSize: 22, lineHeight: 1 }}>{CAT[cat].emoji}</span>
+                <span style={{
+                  fontSize: 12, fontWeight: active ? 600 : 400,
+                  color: active ? '#ffffff' : 'rgba(255,255,255,0.7)',
+                  textTransform: 'uppercase', letterSpacing: '0.12em',
+                }}>
+                  {CAT[cat].label}
+                </span>
+              </button>
+            )
+          })}
+        </div>
 
-              {/* Track info — below mini vinyl */}
-              <div className="absolute" style={{ top: '180px', left: '32px', maxWidth: '220px' }}>
-                <h1
-                  style={{ ...fontDisplay, fontWeight: 700, fontSize: '13px' }}
-                  className="text-[#aaaaaa] truncate leading-tight"
-                >
-                  {loading ? '···' : (currentTrack?.title ?? 'NO TRACKS')}
-                </h1>
-                <p style={fontMono} className="text-[8px] tracking-[0.2em] uppercase text-[#383838] truncate mt-1">
-                  {!loading && currentTrack ? currentTrack.artist : ''}
-                </p>
-              </div>
-
-              {/* Big NEXT + small Play/Pause — center of left area */}
-              <div className="flex-1 flex items-center justify-center">
-                <div className="flex flex-col items-center gap-5">
-                  {/* Small Play/Pause — unaccented, above Next */}
-                  <motion.button
-                    whileTap={{ scale: 0.88 }}
-                    onClick={(e) => { e.stopPropagation(); togglePlay(); resetIdleTimer() }}
-                    className="flex items-center gap-2 cursor-pointer opacity-40 hover:opacity-70 transition-opacity"
-                  >
-                    {isPlaying
-                      ? <Pause weight="fill" size={18} color="#aaaaaa" />
-                      : <Play  weight="fill" size={18} color="#aaaaaa" />
-                    }
-                    <span style={fontMono} className="text-[8px] tracking-[0.3em] uppercase text-[#555555]">
-                      {isPlaying ? 'pause' : 'play'}
-                    </span>
-                  </motion.button>
-
-                  {/* Big NEXT — main action */}
-                  <motion.button
-                    whileTap={{ scale: 0.92 }}
-                    onClick={(e) => { e.stopPropagation(); next(); resetIdleTimer() }}
-                    className="w-28 h-28 rounded-full border-2 border-[#c8c8c8] flex items-center justify-center cursor-pointer hover:bg-[#1a1a1a] transition-colors"
-                  >
-                    <SkipForward weight="fill" size={52} color="#c8c8c8" />
-                  </motion.button>
-                </div>
-              </div>
-
-              {/* Progress + Skip + Volume — bottom */}
-              <div className="shrink-0 px-8 pb-8 flex flex-col gap-4">
-                {/* Progress */}
-                <div>
-                  <div className="flex justify-between mb-1.5">
-                    <span style={fontMono} className="text-[9px] text-[#3a3a3a]">{formatTime(currentTime)}</span>
-                    <span style={fontMono} className="text-[9px] text-[#3a3a3a]">{formatTime(duration)}</span>
-                  </div>
-                  <div className="w-full h-[2px] bg-[#1e1e1e]">
-                    <div
-                      className="h-full bg-[#555555]"
-                      style={{ width: `${progress * 100}%`, transition: 'width 0.2s linear' }}
-                    />
-                  </div>
-                </div>
-
-                {/* Volume */}
-                <div className="flex items-center gap-4">
-                  <div className="flex-1 flex items-center gap-3">
-                    {volume === 0
-                      ? <SpeakerSimpleNone weight="fill" size={13} color="#555555" />
-                      : volume < 0.5
-                        ? <SpeakerSimpleLow  weight="fill" size={13} color="#555555" />
-                        : <SpeakerSimpleHigh weight="fill" size={13} color="#555555" />
-                    }
-                    <div
-                      ref={volumeRef}
-                      className="flex-1 h-[2px] bg-[#222222] relative cursor-pointer group"
-                      onMouseDown={onVolumeMouseDown}
-                    >
-                      <div className="h-full bg-[#666666]" style={{ width: `${volume * 100}%` }} />
-                      <div
-                        className="absolute top-1/2 -translate-y-1/2 w-3 h-3 rounded-full bg-[#b0b0b0] shadow transition-transform group-hover:scale-110"
-                        style={{ left: `calc(${volume * 100}% - 6px)`, pointerEvents: 'none' }}
-                      />
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {/* RIGHT — Library full height */}
-            <div className="w-[280px] shrink-0 flex flex-col overflow-hidden border-l border-[#1e1e1e]">
-              <ClientLibrary
-                library={library}
-                loading={libLoading}
-                currentTrack={currentTrack}
-                replaceQueueAndPlay={replaceQueueAndPlay}
-              />
-            </div>
-
-          </motion.div>
-        )}
-
-      </AnimatePresence>
+      </div>
     </div>
   )
 }

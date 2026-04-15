@@ -24,14 +24,84 @@
 
 html, body, #root {
   height: 100%;
-  background: #111111;
-  font-family: 'Assistant', sans-serif;
+  background: #0a0a0a;
+  font-family: -apple-system, 'Inter', 'Assistant', sans-serif;
   color: #fafafa;
   overflow: hidden;
   user-select: none;
   -webkit-user-select: none;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  overscroll-behavior: none;
+  touch-action: none;
+}
+
+button {
+  touch-action: manipulation;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+@keyframes barBounce {
+  0%, 100% { transform: scaleY(0.4); }
+  50%       { transform: scaleY(1.0); }
+}
+
+/* ── Mobile portrait (≤767px) ── */
+@media (max-width: 767px) {
+  .player-root {
+    flex-direction: column !important;
+    align-items: center;
+  }
+  .player-left {
+    width: 100% !important;
+    height: auto !important;
+    flex-shrink: 0;
+    padding: 20px 0 0;
+  }
+  .player-cover-wrapper {
+    width: 65vw !important;
+    max-width: 300px !important;
+  }
+  .player-right {
+    width: 100% !important;
+    padding: 12px 20px 16px !important;
+  }
+  .player-title {
+    font-size: 24px !important;
+    white-space: normal !important;
+    text-overflow: clip !important;
+    word-break: break-word;
+    display: -webkit-box !important;
+    -webkit-line-clamp: 2 !important;
+    line-clamp: 2 !important;
+    -webkit-box-orient: vertical !important;
+    overflow: hidden !important;
+  }
+  .player-artist {
+    font-size: 16px !important;
+  }
+  .player-btn-play {
+    width: 80px !important;
+    height: 80px !important;
+  }
+  .player-btn-next {
+    width: 64px !important;
+    height: 64px !important;
+  }
+  .player-volume-row {
+    justify-content: center;
+  }
+  .player-volume-wrap {
+    width: 70vw !important;
+  }
+  .player-cats {
+    justify-content: center !important;
+  }
+  .player-cat-btn {
+    flex: 0 0 100px !important;
+    min-height: 60px !important;
+  }
 }
 
 .lib-scroll::-webkit-scrollbar {

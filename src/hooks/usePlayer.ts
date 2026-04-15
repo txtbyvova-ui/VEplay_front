@@ -38,14 +38,14 @@ export function usePlayer() {
   const [duration, setDuration] = useState(0)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [volume, setVolume] = useState(0.8)
+  const [volume, setVolume] = useState(0.7)
 
   const FADE_MS = 1600
 
   const audioRef    = useRef<HTMLAudioElement>(new Audio())
   const tracksRef   = useRef(tracks)
   const categoryRef = useRef(getTimeCategory())
-  const volumeRef   = useRef(0.8)   // mirrors volume state
+  const volumeRef   = useRef(0.7)   // mirrors volume state
   const fadeRef     = useRef(1)     // 0–1 multiplier applied on top of volumeRef
   const fadeTm      = useRef<ReturnType<typeof setInterval> | null>(null)
 
