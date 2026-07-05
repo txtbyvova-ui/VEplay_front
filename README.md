@@ -1,73 +1,83 @@
-# React + TypeScript + Vite
+# VEgroove Play
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Музыкальный плеер-«винил» для заведений. Локальный Node-сервер раздаёт треки,
+React-фронтенд их проигрывает. Музыка разложена по категориям времени суток
+(`morning` / `day` / `evening`); плеер сам переключает категорию по часам.
 
-Currently, two official plugins are available:
+Доступ — по логину/паролю: каждому пользователю администратор выдаёт нужные
+папки (категории). Есть веб-админка для управления пользователями.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## Требования
 
-## React Compiler
+- Node.js 18+ (проверено на Node 24). `node -v` должен работать.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## Структура музыки
 
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```
+<MUSIC_ROOT>/
+  morning/   *.mp3 | *.wav | *.flac
+  day/
+  evening/
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+Имя файла `Artist - Title.mp3` разбирается на исполнителя и название.
+По умолчанию `MUSIC_ROOT` указывает на папку `../VEplay_demo` рядом с проектом.
+Чтобы указать свою папку — задайте переменную окружения:
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```powershell
+$env:MUSIC_ROOT = "E:\Clients_music\Mates"
 ```
+
+## Запуск
+
+Нужны два процесса — бэкенд (порт 3001) и фронтенд (порт 5173).
+
+```powershell
+# 1) установка зависимостей (один раз)
+npm install
+
+# 2) бэкенд — раздача музыки + авторизация
+npm run server
+
+# 3) в другом окне — фронтенд (dev)
+npm run dev
+```
+
+Открыть http://localhost:5173.
+
+Прод-сборка фронтенда: `npm run build` → статика в `dist/` (раздаётся любым
+статик-сервером; бэкенд `server.mjs` всё равно должен работать).
+
+## Авторизация и админка
+
+- При первом запуске сервер создаёт администратора **`admin` / `admin`** и пишет
+  об этом в консоль. **Смените пароль сразу** (в админке → кнопка «Пароль»).
+  Логин/пароль администратора по умолчанию можно переопределить переменными
+  `ADMIN_USER` / `ADMIN_PASS` до первого запуска.
+- Пользователи и их доступы хранятся в `users.json` (рядом с `server.mjs`).
+  Пароли — в виде `scrypt`-хешей. Файл и секрет `.secret` в `.gitignore` —
+  **не коммитьте их**.
+- Войдя как admin, нажмите «Админка»: добавляйте пользователей, галочками
+  выдавайте им категории, сбрасывайте пароли.
+- Обычный пользователь видит и слышит только разрешённые ему категории.
+  Стриминг защищён токеном: чужую папку нельзя открыть даже по прямой ссылке.
+
+## API (кратко)
+
+| Метод | Путь | Доступ |
+|-------|------|--------|
+| POST | `/auth/login` | публично |
+| GET | `/auth/me` | токен |
+| GET | `/library`, `/tracks?category=` | токен (только свои категории) |
+| GET | `/music/:cat/:file?token=` | токен + проверка категории |
+| GET/POST/PUT/DELETE | `/admin/users[...]` | роль `admin` |
+
+## Конфигурация фронтенда
+
+`.env`:
+
+```
+VITE_API_BASE=http://localhost:3001
+```
+
+Для продакшена укажите адрес бэкенда (см. `.env.example`).

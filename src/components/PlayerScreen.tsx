@@ -3,6 +3,8 @@ import { Play, Pause, SkipForward } from '@phosphor-icons/react'
 import NoiseOverlay from './NoiseOverlay'
 import { usePlayer } from '../hooks/usePlayer'
 import { useLibrary } from '../hooks/useLibrary'
+import { useAuth } from '../auth/AuthContext'
+import type { Category } from '../api'
 
 const COVERS = [
   '/vinyl/030ccb9c4f039102b5ebac6fd7dd02f0.jpg',
@@ -31,8 +33,6 @@ const COVERS = [
   '/vinyl/e7328f457a678182e36bf3d56d66a6fa.jpg',
 ]
 
-type Category = 'morning' | 'day' | 'evening'
-
 const CAT: Record<Category, { label: string }> = {
   morning: { label: 'Morning' },
   day:     { label: 'Day'     },
@@ -45,6 +45,13 @@ function fmt(s: number): string {
 }
 
 function randCover() { return COVERS[Math.floor(Math.random() * COVERS.length)] }
+
+function initialCat(allowed: Category[]): Category {
+  if (allowed.length === 0) return 'day'
+  const h = new Date().getHours()
+  const t: Category = h >= 6 && h < 12 ? 'morning' : h >= 12 && h < 18 ? 'day' : 'evening'
+  return allowed.includes(t) ? t : allowed[0]
+}
 
 function MoonIcon({ size = 20, stroke = 'rgba(255,255,255,0.7)' }: { size?: number; stroke?: string }) {
   return (
@@ -89,7 +96,24 @@ function CatIcon({ cat, size, stroke }: { cat: Category; size?: number; stroke?:
   return <Icon size={size} stroke={stroke} />
 }
 
-export default function PlayerScreen() {
+// Hoisted: stable across renders so the player doesn't re-allocate it every tick.
+const btnBase: React.CSSProperties = {
+  width: 88, height: 88, borderRadius: '50%', border: 'none',
+  display: 'flex', alignItems: 'center', justifyContent: 'center',
+  cursor: 'pointer', flexShrink: 0,
+  transition: 'transform 80ms ease, background 120ms ease',
+  WebkitTapHighlightColor: 'transparent',
+}
+const topBtn: React.CSSProperties = {
+  padding: '7px 12px', fontSize: 12, borderRadius: 10, cursor: 'pointer',
+  background: 'rgba(255,255,255,0.06)', color: 'rgba(255,255,255,0.7)',
+  border: '1px solid rgba(255,255,255,0.12)', WebkitTapHighlightColor: 'transparent',
+}
+
+export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void }) {
+  const { user, logout } = useAuth()
+  const allowed = (user?.categories ?? []) as Category[]
+
   const {
     tracks, currentTrack, currentIndex,
     isPlaying, currentTime, duration,
@@ -99,7 +123,7 @@ export default function PlayerScreen() {
 
   const { library, loading: libLoading } = useLibrary()
 
-  const [activeCat, setActiveCat]     = useState<Category>('day')
+  const [activeCat, setActiveCat]     = useState<Category>(() => initialCat(allowed))
   const [cover, setCover]             = useState(randCover())
   const [coverOpacity, setCoverOpacity] = useState(1)
 
@@ -126,7 +150,7 @@ export default function PlayerScreen() {
   const switchCategory = useCallback((cat: Category) => {
     if (libLoading || cat === activeCat) return
     setActiveCat(cat)
-    const list = library[cat]
+    const list = library[cat] ?? []
     if (list.length > 0) replaceQueueAndPlay(list, 0)
   }, [library, libLoading, activeCat, replaceQueueAndPlay])
 
@@ -166,14 +190,6 @@ export default function PlayerScreen() {
   const press   = (e: React.TouchEvent<HTMLButtonElement>) => { e.currentTarget.style.transform = 'scale(0.93)' }
   const release = (e: React.TouchEvent<HTMLButtonElement>) => { e.currentTarget.style.transform = 'scale(1)' }
 
-  const btnBase: React.CSSProperties = {
-    width: 88, height: 88, borderRadius: '50%', border: 'none',
-    display: 'flex', alignItems: 'center', justifyContent: 'center',
-    cursor: 'pointer', flexShrink: 0,
-    transition: 'transform 80ms ease, background 120ms ease',
-    WebkitTapHighlightColor: 'transparent',
-  }
-
   return (
     <div
       className="player-root"
@@ -183,6 +199,12 @@ export default function PlayerScreen() {
       }}
     >
       <NoiseOverlay />
+
+      {/* Top-right: session controls */}
+      <div style={{ position: 'absolute', top: 14, right: 16, zIndex: 10000, display: 'flex', gap: 8 }}>
+        {onOpenAdmin && <button style={topBtn} onClick={onOpenAdmin}>Админка</button>}
+        <button style={topBtn} onClick={logout}>Выйти</button>
+      </div>
 
       {/* ── LEFT: Album cover (45%) ── */}
       <div
@@ -208,6 +230,7 @@ export default function PlayerScreen() {
             animation: 'spin 8s linear infinite',
             animationPlayState: isPlaying ? 'running' : 'paused',
             boxShadow: 'inset 0 0 60px rgba(0,0,0,0.3), 0 0 40px rgba(0,0,0,0.5)',
+            willChange: 'transform', transform: 'translateZ(0)',
           }}>
             <img
               src={cover}
@@ -271,7 +294,7 @@ export default function PlayerScreen() {
             fontSize: 17, color: 'rgba(255,255,255,0.48)',
             overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis',
           }}>
-            {!loading && currentTrack ? currentTrack.artist : '\u00A0'}
+            {!loading && currentTrack ? currentTrack.artist : ' '}
           </p>
         </div>
 
@@ -366,13 +389,13 @@ export default function PlayerScreen() {
             fontSize: 13, color: 'rgba(255,255,255,0.28)',
             overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis',
           }}>
-            {nextTrack ? `Следующий: ${nextTrack.title}` : '\u00A0'}
+            {nextTrack ? `Следующий: ${nextTrack.title}` : ' '}
           </p>
         </div>
 
-        {/* Playlist switcher */}
+        {/* Playlist switcher — only categories this user may access */}
         <div className="player-cats" style={{ display: 'flex', gap: 10 }}>
-          {(['morning', 'day', 'evening'] as Category[]).map(cat => {
+          {allowed.map(cat => {
             const active = cat === activeCat
             return (
               <button
