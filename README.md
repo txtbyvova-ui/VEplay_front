@@ -11,22 +11,30 @@ React-фронтенд их проигрывает. Музыка разложе�
 
 - Node.js 18+ (проверено на Node 24). `node -v` должен работать.
 
-## Структура музыки
+## Структура музыки: 1 клиент = 1 папка
 
 ```
 <MUSIC_ROOT>/
-  morning/   *.mp3 | *.wav | *.flac
-  day/
-  evening/
+  <folderId клиента>/          # например kafe-myatnaya-utka
+    morning/   *.mp3 | *.wav | *.flac
+    day/
+    evening/
 ```
+
+Каждый клиент — отдельная папка; пользователь клиента привязан к ней через
+`folderId` в `users.json` и видит только её. Админ видит все папки. Папки,
+логин и случайный пароль создаются автоматически в админке («Создать клиента»).
 
 Имя файла `Artist - Title.mp3` разбирается на исполнителя и название.
-По умолчанию `MUSIC_ROOT` указывает на папку `../VEplay_demo` рядом с проектом.
-Чтобы указать свою папку — задайте переменную окружения:
+По умолчанию `MUSIC_ROOT` указывает на `../VEplay_demo` рядом с проектом
+(для новой схемы вложите демо-треки в подпапку клиента). Свой путь:
 
 ```powershell
-$env:MUSIC_ROOT = "E:\Clients_music\Mates"
+$env:MUSIC_ROOT = "E:\Clients_music"
 ```
+
+Где лежат `users.json` и `.secret`, задаёт `DATA_DIR` (по умолчанию — рядом
+с `server.mjs`; на проде — `/var/vegroove`, см. `README_DEPLOY.md`).
 
 ## Запуск
 
@@ -66,11 +74,14 @@ npm run dev
 
 | Метод | Путь | Доступ |
 |-------|------|--------|
-| POST | `/auth/login` | публично |
+| POST | `/auth/login` | публично (rate-limit 10/15 мин на IP) |
 | GET | `/auth/me` | токен |
-| GET | `/library`, `/tracks?category=` | токен (только свои категории) |
-| GET | `/music/:cat/:file?token=` | токен + проверка категории |
+| GET | `/library`, `/tracks?category=` | токен (только своя папка; admin — все) |
+| GET | `/music/:folder/:cat/:file?token=` | токен + проверка папки и категории |
 | GET/POST/PUT/DELETE | `/admin/users[...]` | роль `admin` |
+| GET/POST/DELETE | `/admin/clients[...]` | роль `admin` (создание/удаление клиентов, reset пароля) |
+| POST | `/admin/clients/:folderId/upload?category=` | роль `admin`, multipart, mp3 ≤ 20MB |
+| DELETE | `/admin/clients/:folderId/:cat/:file` | роль `admin` |
 
 ## Конфигурация фронтенда
 

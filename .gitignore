@@ -17,6 +17,9 @@ dist-ssr
 .secret
 users.json
 
+# Local dev tooling
+.claude/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
