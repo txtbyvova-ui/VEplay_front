@@ -1,0 +1,18 @@
+# /etc/caddy/Caddyfile — VEgroove Play
+# Auto-HTTPS (Let's Encrypt) + редирект http→https Caddy делает сам.
+# API-пути проксируются на Node (:3001), всё остальное — статика фронта.
+
+play.vegroove.tech {
+	encode zstd gzip
+
+	@api path /auth/* /admin/* /library /tracks /music/*
+	handle @api {
+		reverse_proxy 127.0.0.1:3001
+	}
+
+	handle {
+		root * /opt/veplay/app/dist
+		try_files {path} /index.html
+		file_server
+	}
+}
