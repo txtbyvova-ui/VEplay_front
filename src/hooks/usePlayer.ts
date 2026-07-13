@@ -1,4 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
+import { API_BASE, authHeaders, resolveSrc } from '../api'
+import type { Category } from '../api'
+import { useAuth } from '../auth/AuthContext'
 
 export interface Track {
   id: string | number
@@ -9,28 +12,25 @@ export interface Track {
   category?: string
 }
 
-function getTimeCategory(): string {
+function getTimeCategory(): Category {
   const h = new Date().getHours()
   if (h >= 6  && h < 12) return 'morning'
   if (h >= 12 && h < 18) return 'day'
   return 'evening'
 }
 
-const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:3001'
-
-function fixSrc(track: Track): Track {
-  return { ...track, src: track.src.replace(/^https?:\/\/[^/]+/, API_BASE) }
-}
-
-async function loadTracks(category?: string): Promise<Track[]> {
-  const cat = category ?? getTimeCategory()
-  const res = await fetch(`${API_BASE}/tracks?category=${cat}`)
-  if (!res.ok) throw new Error(`Server error: ${res.status}`)
-  const tracks: Track[] = await res.json()
-  return tracks.map(fixSrc)
+// First category to play: current time-of-day if the user may access it, else their first folder.
+function pickInitial(allowed: Category[]): Category | null {
+  if (allowed.length === 0) return null
+  const t = getTimeCategory()
+  return allowed.includes(t) ? t : allowed[0]
 }
 
 export function usePlayer() {
+  const { token, user } = useAuth()
+  const allowed    = user?.categories ?? []
+  const allowedKey = allowed.join(',')
+
   const [tracks, setTracks] = useState<Track[]>([])
   const [currentIndex, setCurrentIndex] = useState(0)
   const [isPlaying, setIsPlaying] = useState(false)
@@ -42,9 +42,13 @@ export function usePlayer() {
 
   const FADE_MS = 1600
 
-  const audioRef    = useRef<HTMLAudioElement>(new Audio())
+  // Lazily create ONE audio element (a bare `useRef(new Audio())` would allocate a
+  // throwaway element on every render).
+  const audioRef = useRef<HTMLAudioElement | null>(null)
+  if (!audioRef.current) audioRef.current = new Audio()
+
   const tracksRef   = useRef(tracks)
-  const categoryRef = useRef(getTimeCategory())
+  const categoryRef = useRef<Category | null>(null)
   const volumeRef   = useRef(0.7)   // mirrors volume state
   const fadeRef     = useRef(1)     // 0–1 multiplier applied on top of volumeRef
   const fadeTm      = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -52,7 +56,8 @@ export function usePlayer() {
   useEffect(() => { tracksRef.current = tracks }, [tracks])
 
   const applyVol = () => {
-    audioRef.current.volume = Math.min(1, Math.max(0, volumeRef.current * fadeRef.current))
+    const a = audioRef.current
+    if (a) a.volume = Math.min(1, Math.max(0, volumeRef.current * fadeRef.current))
   }
 
   const clearFadeTm = () => {
@@ -90,19 +95,33 @@ export function usePlayer() {
 
   const currentTrack = tracks[currentIndex] ?? null
 
-  // Initial fetch — load tracks for current time of day
-  useEffect(() => {
-    loadTracks()
-      .then(t => { setTracks(t); setLoading(false) })
-      .catch(e => { setError(String(e)); setLoading(false) })
-  }, [])
+  const loadTracks = useCallback(async (category: Category): Promise<Track[]> => {
+    const res = await fetch(`${API_BASE}/tracks?category=${category}`, { headers: authHeaders(token) })
+    if (!res.ok) throw new Error(`Server error: ${res.status}`)
+    const data: Track[] = await res.json()
+    return data.map(t => ({ ...t, src: resolveSrc(t.src, token) }))
+  }, [token])
 
-  // Time-of-day auto rotation: check every minute; swap queue when period changes
-  // Current track keeps playing — only future tracks in queue change
+  // Initial fetch — load tracks for the user's current allowed category
+  useEffect(() => {
+    const cat = pickInitial(allowed)
+    if (!token || !cat) { setTracks([]); setLoading(false); return }
+    categoryRef.current = cat
+    let cancelled = false
+    setLoading(true)
+    loadTracks(cat)
+      .then(t => { if (!cancelled) { setTracks(t); setCurrentIndex(0); setLoading(false) } })
+      .catch(e => { if (!cancelled) { setError(String(e)); setLoading(false) } })
+    return () => { cancelled = true }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, allowedKey, loadTracks])
+
+  // Time-of-day auto rotation: check every minute; swap queue when the period
+  // changes AND the user is allowed that category.
   useEffect(() => {
     const id = setInterval(() => {
       const newCat = getTimeCategory()
-      if (newCat !== categoryRef.current) {
+      if (allowed.includes(newCat) && newCat !== categoryRef.current) {
         categoryRef.current = newCat
         loadTracks(newCat).then(newTracks => {
           setTracks(newTracks)
@@ -111,14 +130,15 @@ export function usePlayer() {
       }
     }, 60_000)
     return () => clearInterval(id)
-  }, [])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allowedKey, loadTracks])
 
   // Sync user volume — respect current fade multiplier
   useEffect(() => { volumeRef.current = volume; applyVol() }, [volume])
 
   // Wire audio events once
   useEffect(() => {
-    const audio = audioRef.current
+    const audio = audioRef.current!
     const onTime = () => setCurrentTime(audio.currentTime)
     const onDuration = () => setDuration(isFinite(audio.duration) ? audio.duration : 0)
     const onEnded = () => setCurrentIndex(i => (i + 1) % (tracksRef.current.length || 1))
@@ -139,7 +159,7 @@ export function usePlayer() {
     clearFadeTm()
     fadeRef.current = 0
     applyVol()
-    audioRef.current.src = currentTrack.src
+    audioRef.current!.src = currentTrack.src
     setCurrentTime(0)
     setDuration(0)
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -148,7 +168,7 @@ export function usePlayer() {
   // Sync play / pause state — fade in on play, no fade on unpause
   useEffect(() => {
     if (!currentTrack) return
-    const audio = audioRef.current
+    const audio = audioRef.current!
     if (isPlaying) {
       if (fadeRef.current < 0.05) startFadeIn(FADE_MS)   // new track: fade in
       const p = audio.play()
@@ -178,7 +198,7 @@ export function usePlayer() {
   }, [])
 
   const seek = useCallback((ratio: number) => {
-    const audio = audioRef.current
+    const audio = audioRef.current!
     if (isFinite(audio.duration) && audio.duration > 0) {
       audio.currentTime = ratio * audio.duration
     }

@@ -22,7 +22,7 @@ export default function NoiseOverlay() {
       data[i] = value     // R
       data[i + 1] = value // G
       data[i + 2] = value // B
-      data[i + 3] = 255   // A (fully opaque — we control visibility with CSS opacity)
+      data[i + 3] = 255   // A (fully opaque — visibility controlled via CSS opacity)
     }
 
     ctx.putImageData(imageData, 0, 0)
@@ -33,9 +33,14 @@ export default function NoiseOverlay() {
       ref={canvasRef}
       className="fixed inset-0 pointer-events-none z-[9999] w-full h-full"
       style={{
-        opacity: 0.035,
-        mixBlendMode: 'overlay',
+        // NOTE: previously used `mix-blend-mode: overlay`, which forced the
+        // compositor to re-blend the WHOLE viewport on every frame of the vinyl
+        // spin → jank on weaker GPUs / iPad. A static low-opacity grain on its own
+        // promoted layer composites once and never repaints.
+        opacity: 0.05,
         imageRendering: 'pixelated',
+        contain: 'strict',
+        transform: 'translateZ(0)',
       }}
     />
   )
