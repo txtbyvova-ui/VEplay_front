@@ -24,6 +24,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // Validate any stored token once on mount.
   useEffect(() => {
     const stored = localStorage.getItem(TOKEN_KEY)
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- no stored token → done loading
     if (!stored) { setLoading(false); return }
     let cancelled = false
     fetch(`${API_BASE}/auth/me`, { headers: authHeaders(stored) })

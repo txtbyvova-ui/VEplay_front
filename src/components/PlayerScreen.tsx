@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, memo } from 'react'
 import { Play, Pause, SkipForward } from '@phosphor-icons/react'
 import NoiseOverlay from './NoiseOverlay'
 import { usePlayer } from '../hooks/usePlayer'
@@ -38,6 +38,8 @@ const CAT: Record<Category, { label: string }> = {
   day:     { label: 'Day'     },
   evening: { label: 'Evening' },
 }
+// Mode B single-playlist folder ('all') has no time-of-day label.
+const catLabel = (c: string) => (c === 'all' ? 'Плейлист' : CAT[c as Category]?.label ?? c)
 
 function fmt(s: number): string {
   if (!isFinite(s) || isNaN(s) || s < 0) return '0:00'
@@ -46,10 +48,10 @@ function fmt(s: number): string {
 
 function randCover() { return COVERS[Math.floor(Math.random() * COVERS.length)] }
 
-function initialCat(allowed: Category[]): Category {
+function initialCat(allowed: string[]): string {
   if (allowed.length === 0) return 'day'
   const h = new Date().getHours()
-  const t: Category = h >= 6 && h < 12 ? 'morning' : h >= 12 && h < 18 ? 'day' : 'evening'
+  const t = h >= 6 && h < 12 ? 'morning' : h >= 12 && h < 18 ? 'day' : 'evening'
   return allowed.includes(t) ? t : allowed[0]
 }
 
@@ -90,9 +92,17 @@ function SpeakerIcon({ size = 18, stroke = 'rgba(255,255,255,0.7)' }: { size?: n
     </svg>
   )
 }
-const CAT_ICONS = { morning: MoonIcon, day: SunIcon, evening: SunsetIcon }
-function CatIcon({ cat, size, stroke }: { cat: Category; size?: number; stroke?: string }) {
-  const Icon = CAT_ICONS[cat]
+function DiscIcon({ size = 20, stroke = 'rgba(255,255,255,0.7)' }: { size?: number; stroke?: string }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={stroke} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="9"/>
+      <circle cx="12" cy="12" r="3"/>
+    </svg>
+  )
+}
+const CAT_ICONS = { morning: MoonIcon, day: SunIcon, evening: SunsetIcon, all: DiscIcon }
+function CatIcon({ cat, size, stroke }: { cat: string; size?: number; stroke?: string }) {
+  const Icon = (CAT_ICONS as Record<string, typeof MoonIcon>)[cat] ?? SunIcon
   return <Icon size={size} stroke={stroke} />
 }
 
@@ -110,9 +120,122 @@ const topBtn: React.CSSProperties = {
   border: '1px solid rgba(255,255,255,0.12)', WebkitTapHighlightColor: 'transparent',
 }
 
+// Tap feedback — pure DOM, hoisted so it's referentially stable for memoized children.
+const press   = (e: React.TouchEvent<HTMLButtonElement>) => { e.currentTarget.style.transform = 'scale(0.93)' }
+const release = (e: React.TouchEvent<HTMLButtonElement>) => { e.currentTarget.style.transform = 'scale(1)' }
+
+// ── Spinning vinyl — memoized so the ~4×/sec currentTime ticks never re-render
+// its SVG grooves / gradients / cover. Re-renders only when cover / opacity /
+// isPlaying change. ──
+interface VinylProps {
+  cover: string
+  coverOpacity: number
+  isPlaying: boolean
+  onSwipeStart: (e: React.TouchEvent) => void
+  onSwipeEnd: (e: React.TouchEvent) => void
+}
+const Vinyl = memo(function Vinyl({ cover, coverOpacity, isPlaying, onSwipeStart, onSwipeEnd }: VinylProps) {
+  return (
+    <div
+      className="player-cover-wrapper"
+      style={{ position: 'relative', zIndex: 1, width: 'min(calc(100% - 56px), 420px)', aspectRatio: '1 / 1' }}
+      onTouchStart={onSwipeStart}
+      onTouchEnd={onSwipeEnd}
+    >
+      {/* Spinning disc — border-radius 50% clips to circle */}
+      <div style={{
+        position: 'relative', width: '100%', height: '100%',
+        borderRadius: '50%', overflow: 'hidden',
+        animation: 'spin 8s linear infinite',
+        animationPlayState: isPlaying ? 'running' : 'paused',
+        boxShadow: 'inset 0 0 60px rgba(0,0,0,0.3), 0 0 40px rgba(0,0,0,0.5)',
+        willChange: 'transform', transform: 'translateZ(0)',
+      }}>
+        <img
+          src={cover}
+          alt="cover"
+          draggable={false}
+          style={{
+            width: '100%', height: '100%', objectFit: 'cover',
+            display: 'block', opacity: coverOpacity,
+            transition: 'opacity 300ms ease',
+          }}
+        />
+        {/* Vinyl groove lines overlay */}
+        <svg
+          style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none', opacity: 0.18 }}
+          viewBox="0 0 200 200"
+        >
+          {[18, 28, 38, 48, 58, 68, 76, 84, 90].map(r => (
+            <circle key={r} cx="100" cy="100" r={r} fill="none" stroke="rgba(0,0,0,0.9)" strokeWidth="0.8" />
+          ))}
+        </svg>
+        {/* Depth sheen */}
+        <div style={{
+          position: 'absolute', inset: 0, pointerEvents: 'none',
+          background: 'radial-gradient(circle at 35% 30%, rgba(255,255,255,0.07) 0%, transparent 55%), radial-gradient(circle at center, transparent 65%, rgba(0,0,0,0.35) 100%)',
+        }} />
+      </div>
+      {/* Center spindle */}
+      <div style={{
+        position: 'absolute', top: '50%', left: '50%',
+        transform: 'translate(-50%, -50%)',
+        width: 18, height: 18, borderRadius: '50%',
+        background: '#111', border: '2px solid rgba(255,255,255,0.2)',
+        boxShadow: '0 0 12px rgba(0,0,0,0.9)', zIndex: 2, pointerEvents: 'none',
+      }} />
+    </div>
+  )
+})
+
+// ── Category switcher — memoized so currentTime ticks don't re-render the buttons. ──
+interface CategoryBarProps {
+  allowed: string[]
+  activeCat: string
+  onSwitch: (cat: string) => void
+}
+const CategoryBar = memo(function CategoryBar({ allowed, activeCat, onSwitch }: CategoryBarProps) {
+  return (
+    <div className="player-cats" style={{ display: 'flex', gap: 10 }}>
+      {allowed.map(cat => {
+        const active = cat === activeCat
+        return (
+          <button
+            className="player-cat-btn"
+            key={cat}
+            onClick={() => onSwitch(cat)}
+            onTouchStart={press} onTouchEnd={release}
+            style={{
+              flex: 1, minHeight: 80, borderRadius: 16, border: 'none',
+              background: active ? 'rgba(255,255,255,0.13)' : 'rgba(255,255,255,0.04)',
+              outline: active ? '1.5px solid rgba(255,255,255,0.4)' : '1.5px solid rgba(255,255,255,0.07)',
+              cursor: 'pointer',
+              display: 'flex', flexDirection: 'column',
+              alignItems: 'center', justifyContent: 'center', gap: 5,
+              opacity: active ? 1 : 0.55,
+              transition: 'background 150ms, opacity 150ms, transform 80ms',
+              WebkitTapHighlightColor: 'transparent',
+            }}
+          >
+            <CatIcon cat={cat} size={20} stroke={active ? 'rgba(255,255,255,1)' : 'rgba(255,255,255,0.4)'} />
+            <span style={{
+              fontSize: 12, fontWeight: active ? 600 : 400,
+              color: active ? '#ffffff' : 'rgba(255,255,255,0.7)',
+              textTransform: 'uppercase', letterSpacing: '0.12em',
+            }}>
+              {catLabel(cat)}
+            </span>
+          </button>
+        )
+      })}
+    </div>
+  )
+})
+
 export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void }) {
   const { user, logout } = useAuth()
-  const allowed = (user?.categories ?? []) as Category[]
+  const allowed = (user?.categories ?? []) as string[]
+  const singlePlaylist = user?.singlePlaylist === true
 
   const {
     tracks, currentTrack, currentIndex,
@@ -123,7 +246,7 @@ export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void
 
   const { library, loading: libLoading } = useLibrary()
 
-  const [activeCat, setActiveCat]     = useState<Category>(() => initialCat(allowed))
+  const [activeCat, setActiveCat]     = useState<string>(() => initialCat(allowed))
   const [cover, setCover]             = useState(randCover())
   const [coverOpacity, setCoverOpacity] = useState(1)
 
@@ -133,21 +256,23 @@ export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void
     ? tracks[(currentIndex + 1) % tracks.length]
     : null
 
-  // Crossfade cover on track change
+  // Crossfade cover on track change (intentional: kicks off the fade on track swap)
   useEffect(() => {
     const newCover = randCover()
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- start the crossfade
     setCoverOpacity(0)
     const t = setTimeout(() => { setCover(newCover); setCoverOpacity(1) }, 150)
     return () => clearTimeout(t)
   }, [currentTrack?.id])
 
-  // Keep active category in sync with playing track
+  // Keep active category in sync with the playing track
   useEffect(() => {
     const c = currentTrack?.category
-    if (c === 'morning' || c === 'day' || c === 'evening') setActiveCat(c)
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- sync UI to external (audio) state
+    if (c === 'morning' || c === 'day' || c === 'evening' || c === 'all') setActiveCat(c)
   }, [currentTrack?.category])
 
-  const switchCategory = useCallback((cat: Category) => {
+  const switchCategory = useCallback((cat: string) => {
     if (libLoading || cat === activeCat) return
     setActiveCat(cat)
     const list = library[cat] ?? []
@@ -176,19 +301,15 @@ export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void
     setVolume(Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)))
   }
 
-  // Swipe handlers on cover
-  const onSwipeStart = (e: React.TouchEvent) => { swipeX.current = e.touches[0].clientX }
-  const onSwipeEnd   = (e: React.TouchEvent) => {
+  // Swipe handlers on cover — stable so the memoized Vinyl doesn't re-render each tick.
+  const onSwipeStart = useCallback((e: React.TouchEvent) => { swipeX.current = e.touches[0].clientX }, [])
+  const onSwipeEnd = useCallback((e: React.TouchEvent) => {
     if (swipeX.current === null) return
     const d = e.changedTouches[0].clientX - swipeX.current
     swipeX.current = null
     if (Math.abs(d) < 50) return
     if (d < 0) next()
-  }
-
-  // Button tap feedback helpers
-  const press   = (e: React.TouchEvent<HTMLButtonElement>) => { e.currentTarget.style.transform = 'scale(0.93)' }
-  const release = (e: React.TouchEvent<HTMLButtonElement>) => { e.currentTarget.style.transform = 'scale(1)' }
+  }, [next])
 
   return (
     <div
@@ -216,56 +337,13 @@ export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void
           background: 'linear-gradient(135deg, #0f0f0f 0%, #1c1c1c 50%, #0d0d0d 100%)',
         }}
       >
-        {/* Spinning vinyl */}
-        <div
-          className="player-cover-wrapper"
-          style={{ position: 'relative', zIndex: 1, width: 'min(calc(100% - 56px), 420px)', aspectRatio: '1 / 1' }}
-          onTouchStart={onSwipeStart}
-          onTouchEnd={onSwipeEnd}
-        >
-          {/* Spinning disc — border-radius 50% clips to circle */}
-          <div style={{
-            position: 'relative', width: '100%', height: '100%',
-            borderRadius: '50%', overflow: 'hidden',
-            animation: 'spin 8s linear infinite',
-            animationPlayState: isPlaying ? 'running' : 'paused',
-            boxShadow: 'inset 0 0 60px rgba(0,0,0,0.3), 0 0 40px rgba(0,0,0,0.5)',
-            willChange: 'transform', transform: 'translateZ(0)',
-          }}>
-            <img
-              src={cover}
-              alt="cover"
-              draggable={false}
-              style={{
-                width: '100%', height: '100%', objectFit: 'cover',
-                display: 'block', opacity: coverOpacity,
-                transition: 'opacity 300ms ease',
-              }}
-            />
-            {/* Vinyl groove lines overlay */}
-            <svg
-              style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none', opacity: 0.18 }}
-              viewBox="0 0 200 200"
-            >
-              {[18, 28, 38, 48, 58, 68, 76, 84, 90].map(r => (
-                <circle key={r} cx="100" cy="100" r={r} fill="none" stroke="rgba(0,0,0,0.9)" strokeWidth="0.8" />
-              ))}
-            </svg>
-            {/* Depth sheen */}
-            <div style={{
-              position: 'absolute', inset: 0, pointerEvents: 'none',
-              background: 'radial-gradient(circle at 35% 30%, rgba(255,255,255,0.07) 0%, transparent 55%), radial-gradient(circle at center, transparent 65%, rgba(0,0,0,0.35) 100%)',
-            }} />
-          </div>
-          {/* Center spindle */}
-          <div style={{
-            position: 'absolute', top: '50%', left: '50%',
-            transform: 'translate(-50%, -50%)',
-            width: 18, height: 18, borderRadius: '50%',
-            background: '#111', border: '2px solid rgba(255,255,255,0.2)',
-            boxShadow: '0 0 12px rgba(0,0,0,0.9)', zIndex: 2, pointerEvents: 'none',
-          }} />
-        </div>
+        <Vinyl
+          cover={cover}
+          coverOpacity={coverOpacity}
+          isPlaying={isPlaying}
+          onSwipeStart={onSwipeStart}
+          onSwipeEnd={onSwipeEnd}
+        />
       </div>
 
       {/* ── RIGHT: Controls (55%) ── */}
@@ -280,7 +358,7 @@ export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10 }}>
             <CatIcon cat={activeCat} size={14} stroke="rgba(255,255,255,0.28)" />
             <span style={{ fontSize: 11, letterSpacing: '0.28em', textTransform: 'uppercase', color: 'rgba(255,255,255,0.28)' }}>
-              {CAT[activeCat].label}
+              {catLabel(activeCat)}
             </span>
           </div>
           <h1 className="player-title" style={{
@@ -393,40 +471,10 @@ export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void
           </p>
         </div>
 
-        {/* Playlist switcher — only categories this user may access */}
-        <div className="player-cats" style={{ display: 'flex', gap: 10 }}>
-          {allowed.map(cat => {
-            const active = cat === activeCat
-            return (
-              <button
-                className="player-cat-btn"
-                key={cat}
-                onClick={() => switchCategory(cat)}
-                onTouchStart={press} onTouchEnd={release}
-                style={{
-                  flex: 1, minHeight: 80, borderRadius: 16, border: 'none',
-                  background: active ? 'rgba(255,255,255,0.13)' : 'rgba(255,255,255,0.04)',
-                  outline: active ? '1.5px solid rgba(255,255,255,0.4)' : '1.5px solid rgba(255,255,255,0.07)',
-                  cursor: 'pointer',
-                  display: 'flex', flexDirection: 'column',
-                  alignItems: 'center', justifyContent: 'center', gap: 5,
-                  opacity: active ? 1 : 0.55,
-                  transition: 'background 150ms, opacity 150ms, transform 80ms',
-                  WebkitTapHighlightColor: 'transparent',
-                }}
-              >
-                <CatIcon cat={cat} size={20} stroke={active ? 'rgba(255,255,255,1)' : 'rgba(255,255,255,0.4)'} />
-                <span style={{
-                  fontSize: 12, fontWeight: active ? 600 : 400,
-                  color: active ? '#ffffff' : 'rgba(255,255,255,0.7)',
-                  textTransform: 'uppercase', letterSpacing: '0.12em',
-                }}>
-                  {CAT[cat].label}
-                </span>
-              </button>
-            )
-          })}
-        </div>
+        {/* Playlist switcher — only categories this user may access (hidden in single-playlist mode) */}
+        {!singlePlaylist && allowed.length > 1 && (
+          <CategoryBar allowed={allowed} activeCat={activeCat} onSwitch={switchCategory} />
+        )}
 
       </div>
     </div>

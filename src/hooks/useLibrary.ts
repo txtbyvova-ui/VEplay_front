@@ -1,10 +1,10 @@
 import { useState, useEffect } from 'react'
 import type { Track } from './usePlayer'
 import { API_BASE, authHeaders, resolveSrc } from '../api'
-import type { Category } from '../api'
 import { useAuth } from '../auth/AuthContext'
 
-export type Library = Partial<Record<Category, Track[]>>
+// Keys are category names: 'morning'|'day'|'evening' (Mode A) or 'all' (Mode B single playlist).
+export type Library = Partial<Record<string, Track[]>>
 
 export function useLibrary() {
   const { token } = useAuth()
@@ -13,6 +13,7 @@ export function useLibrary() {
   const [error,   setError]   = useState<string | null>(null)
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset loading when signed out
     if (!token) { setLoading(false); return }
     let cancelled = false
     setLoading(true)
@@ -22,7 +23,7 @@ export function useLibrary() {
         if (cancelled) return
         const fixed: Library = {}
         for (const cat of Object.keys(data)) {
-          fixed[cat as Category] = data[cat].map(t => ({ ...t, src: resolveSrc(t.src, token) }))
+          fixed[cat] = data[cat].map(t => ({ ...t, src: resolveSrc(t.src, token) }))
         }
         setLibrary(fixed)
         setLoading(false)

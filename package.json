@@ -8,20 +8,21 @@
     "server": "node server.mjs",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
+    "check:server": "tsc -p jsconfig.json",
+    "test:server": "node test/classify.routes.test.mjs && node test/upload_timeout.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
     "@phosphor-icons/react": "^2.1.10",
     "@tailwindcss/vite": "^4.2.2",
     "busboy": "^1.6.0",
-    "framer-motion": "^12.38.0",
-    "lucide-react": "^1.7.0",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
     "tailwindcss": "^4.2.2"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",
+    "@types/busboy": "^1.5.4",
     "@types/node": "^24.12.2",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",

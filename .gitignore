@@ -12,10 +12,15 @@ dist
 dist-ssr
 *.local
 .env
+.env.production
 
 # Auth data (secrets / credentials — never commit)
 .secret
 users.json
+
+# VEclassify bridge: staging area + batch state (transient, per-machine)
+_incoming/
+pending_batches.json
 
 # Local dev tooling
 .claude/
