@@ -25,6 +25,13 @@ pending_batches.json
 # Local dev tooling
 .claude/
 
+# Auth data (secrets / credentials — never commit)
+.secret
+users.json
+
+# Local dev tooling
+.claude/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
