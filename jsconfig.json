@@ -1,0 +1,16 @@
+{
+  "//": "Dev-only strict type-check of the plain-JS server (`npx tsc -p jsconfig.json`). The server runs directly via `node server.mjs` — there is NO build step / emit.",
+  "compilerOptions": {
+    "checkJs": true,
+    "allowJs": true,
+    "noEmit": true,
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "target": "es2022",
+    "lib": ["es2023"],
+    "strict": true,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["server.mjs", "server/**/*.mjs"]
+}
