@@ -81,6 +81,39 @@ npm ci
 npm run build       # tsc -b && vite build → dist/
 ```
 
+## 5б. Классификатор VEclassify (Python-мост)
+
+Админка умеет загрузить целую папку mp3 и автоматически разложить треки по
+`morning`/`day`/`evening` (VEclassify: librosa + Gemini). Node запускает Python
+как подпроцесс — его надо развернуть рядом с приложением.
+
+```bash
+# системные зависимости для librosa / soundfile / декодирования аудио
+apt -y install python3.12 python3.12-venv ffmpeg libsndfile1
+
+su - veplay
+# VEclassify — сосед каталога app (сервер по умолчанию ищет ../VEclassify)
+git clone <repo-VEclassify> /opt/veplay/VEclassify        # или скопировать каталог
+cd /opt/veplay/VEclassify
+python3.12 -m venv .venv
+.venv/bin/pip install -r requirements.txt                 # librosa, mutagen, google-genai, ...
+
+# Gemini-ключ с РАБОЧЕЙ квотой (free-tier быстро исчерпывается → батч уйдёт в error)
+cp .env.example .env
+sed -i 's|^GEMINI_API_KEY=.*|GEMINI_API_KEY=ВАШ_КЛЮЧ|' .env
+```
+
+Проверка моста:
+
+```bash
+.venv/bin/python classify_stage.py --folder /path/с/mp3 --json | head -c 200
+# нет папки/ключа/пусто → exit 1 с сообщением в stderr; успех → {"tracks":[...]}
+```
+
+`CLASSIFY_PYTHON` / `CLASSIFY_SCRIPT` уже заданы в `deploy/ecosystem.config.cjs`.
+Staging загрузок — `MUSIC_ROOT/_incoming/<batchId>/` (временное, сервер чистит сам);
+состояние батчей — `DATA_DIR/pending_batches.json`. Оба уже в `.gitignore`.
+
 ## 6. Первый запуск бэкенда
 
 Пароль первого администратора: задайте свой ДО первого старта (иначе будет
@@ -126,8 +159,9 @@ reboot                                                  # после ребут�
 ```
 
 Дальше — зайти на https://play.vegroove.tech под админом, создать первого
-клиента (папка + логин + одноразовый пароль создаются автоматически) и
-загрузить mp3 по категориям.
+клиента (папка + логин + одноразовый пароль создаются автоматически) и либо
+загрузить mp3 по категориям вручную, либо нажать «Классифицировать папку» и
+разложить целую папку автоматически (нужен рабочий VEclassify из шага 5б).
 
 ## 9. Обновление (после git push)
 
@@ -143,5 +177,11 @@ sudo -u veplay bash /opt/veplay/app/deploy/deploy.sh
   доступен только через Caddy.
 - Rate-limit на `/auth/login`: 10 попыток / 15 минут с одного IP; реальный IP
   берётся из `X-Forwarded-For` только для соединений с localhost (т.е. от Caddy).
-- Лимиты загрузки: только mp3 (`audio/mpeg`), ≤ 20MB на файл, ≤ 20 файлов за раз.
-- Бэкап = скопировать `/var/vegroove` целиком (users.json, .secret, музыка).
+- Лимиты загрузки: **ручная** (по категории) — только mp3 (`audio/mpeg`), ≤ 20MB/файл,
+  ≤ 20 файлов за раз; **классификатор папки** — до 500 файлов и `MAX_UPLOAD_BYTES`
+  (дефолт 2 ГБ) на батч, время запроса ограничено `REQUEST_TIMEOUT_MS` (дефолт 1 ч —
+  поднят с Node-дефолта 300с, который давал 408 на больших/медленных загрузках).
+- Классификация зависит от квоты Gemini-ключа: при 429/невалидном ключе батч
+  корректно уходит в статус `error` (сервер жив), а не виснет.
+- Бэкап = скопировать `/var/vegroove` целиком (users.json, .secret,
+  pending_batches.json, музыка) + `/opt/veplay/VEclassify/.env` (Gemini-ключ).
