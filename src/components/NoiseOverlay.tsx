@@ -1,46 +1,47 @@
-import { useEffect, useRef } from 'react'
+import { useState } from 'react'
+
+/**
+ * Subtle film-grain / dither overlay.
+ *
+ * Rendered as a small noise TILE repeated at its native pixel size — NOT a 256px
+ * canvas stretched across the whole viewport, which nearest-neighbour-upscaled
+ * each noise pixel into a ~7px block ("8-bit" looking grain) and failed to dither
+ * the dark background gradients (visible banding). At 1:1 the grain is fine and
+ * breaks up gradient banding. Static → the browser composites it once and never
+ * repaints it with the spinning vinyl.
+ */
+function makeNoiseUrl(size = 128): string {
+  const canvas = document.createElement('canvas')
+  canvas.width = size
+  canvas.height = size
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return ''
+  const img = ctx.createImageData(size, size)
+  const d = img.data
+  for (let i = 0; i < d.length; i += 4) {
+    const v = Math.random() * 255
+    d[i] = d[i + 1] = d[i + 2] = v
+    d[i + 3] = 255
+  }
+  ctx.putImageData(img, 0, 0)
+  return canvas.toDataURL('image/png')
+}
 
 export default function NoiseOverlay() {
-  const canvasRef = useRef<HTMLCanvasElement>(null)
-
-  useEffect(() => {
-    const canvas = canvasRef.current
-    if (!canvas) return
-
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return
-
-    const size = 256
-    canvas.width = size
-    canvas.height = size
-
-    const imageData = ctx.createImageData(size, size)
-    const data = imageData.data
-
-    for (let i = 0; i < data.length; i += 4) {
-      const value = Math.random() * 255
-      data[i] = value     // R
-      data[i + 1] = value // G
-      data[i + 2] = value // B
-      data[i + 3] = 255   // A (fully opaque — visibility controlled via CSS opacity)
-    }
-
-    ctx.putImageData(imageData, 0, 0)
-  }, [])
-
+  // Generated once via a lazy state initializer (no effect, no re-render).
+  const [url] = useState(makeNoiseUrl)
+  if (!url) return null
   return (
-    <canvas
-      ref={canvasRef}
-      className="fixed inset-0 pointer-events-none z-[9999] w-full h-full"
+    <div
+      aria-hidden
       style={{
-        // NOTE: previously used `mix-blend-mode: overlay`, which forced the
-        // compositor to re-blend the WHOLE viewport on every frame of the vinyl
-        // spin → jank on weaker GPUs / iPad. A static low-opacity grain on its own
-        // promoted layer composites once and never repaints.
-        opacity: 0.05,
-        imageRendering: 'pixelated',
+        position: 'fixed', inset: 0, pointerEvents: 'none', zIndex: 9999,
+        backgroundImage: `url(${url})`,
+        backgroundRepeat: 'repeat',
+        backgroundSize: '128px 128px',   // native size → 1px grain, no upscaling blocks
+        opacity: 0.045,
         contain: 'strict',
-        transform: 'translateZ(0)',
+        transform: 'translateZ(0)',      // own layer, painted once
       }}
     />
   )
