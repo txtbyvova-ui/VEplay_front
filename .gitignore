@@ -29,6 +29,10 @@ pending_batches.json
 .secret
 users.json
 
+# VEclassify bridge: staging area + batch state (transient, per-machine)
+_incoming/
+pending_batches.json
+
 # Local dev tooling
 .claude/
 

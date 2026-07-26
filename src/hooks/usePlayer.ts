@@ -2,6 +2,10 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { API_BASE, authHeaders, resolveSrc } from '../api'
 import type { Category } from '../api'
 import { useAuth } from '../auth/AuthContext'
+import * as graph from '../audio/graph'
+import * as cache from '../audio/cache'
+import * as ms from '../audio/mediaSession'
+import { loadSession, saveSession } from '../audio/session'
 
 export interface Track {
   id: string | number
@@ -12,6 +16,18 @@ export interface Track {
   category?: string
 }
 
+/** Overlap between two tracks. The next one starts this many seconds before the
+ *  end of the current one, so there is never silence. */
+const CROSSFADE_SEC = 6
+/** Quick fade for a manual next/prev — long enough to avoid a click. */
+const SWITCH_SEC = 0.25
+/** How many upcoming tracks to pull into the offline cache. */
+const PRELOAD_AHEAD = 3
+/** Throttle for writing the resume-point to localStorage. */
+const SAVE_EVERY_MS = 5000
+
+type Side = 'A' | 'B'
+
 function getTimeCategory(): Category {
   const h = new Date().getHours()
   if (h >= 6  && h < 12) return 'morning'
@@ -19,82 +35,128 @@ function getTimeCategory(): Category {
   return 'evening'
 }
 
-// First category to play: current time-of-day if the user may access it, else their first folder.
+/** First category to play: current time-of-day if allowed, else the first one. */
 function pickInitial(allowed: Category[]): Category | null {
   if (allowed.length === 0) return null
   const t = getTimeCategory()
   return allowed.includes(t) ? t : allowed[0]
 }
 
+const identityOrder = (n: number): number[] => Array.from({ length: n }, (_, i) => i)
+
+function shuffledOrder(n: number, startWith?: number): number[] {
+  const idx = identityOrder(n)
+  for (let i = idx.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1))
+    ;[idx[i], idx[j]] = [idx[j], idx[i]]
+  }
+  if (startWith !== undefined) {
+    const at = idx.indexOf(startWith)
+    if (at > 0) { idx.splice(at, 1); idx.unshift(startWith) }
+  }
+  return idx
+}
+
 export function usePlayer() {
   const { token, user } = useAuth()
-  const allowed    = user?.categories ?? []
+  const allowed    = (user?.categories ?? []) as Category[]
   const allowedKey = allowed.join(',')
 
-  const [tracks, setTracks] = useState<Track[]>([])
-  const [currentIndex, setCurrentIndex] = useState(0)
-  const [isPlaying, setIsPlaying] = useState(false)
+  const [tracks, setTracks]           = useState<Track[]>([])
+  const [order, setOrder]             = useState<number[]>([])
+  const [orderPos, setOrderPos]       = useState(0)
+  const [isPlaying, setIsPlaying]     = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
-  const [duration, setDuration] = useState(0)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  const [volume, setVolume] = useState(0.7)
+  const [duration, setDuration]       = useState(0)
+  const [loading, setLoading]         = useState(true)
+  const [error, setError]             = useState<string | null>(null)
+  const [volume, setVolumeState]      = useState(0.7)
+  const [shuffle, setShuffle]         = useState(false)
 
-  const FADE_MS = 1600
-
-  // Lazily create ONE audio element (a bare `useRef(new Audio())` would allocate a
-  // throwaway element on every render).
-  const audioRef = useRef<HTMLAudioElement | null>(null)
-  if (!audioRef.current) audioRef.current = new Audio()
-
-  const tracksRef   = useRef(tracks)
-  const categoryRef = useRef<Category | null>(null)
-  const volumeRef   = useRef(0.7)   // mirrors volume state
-  const fadeRef     = useRef(1)     // 0–1 multiplier applied on top of volumeRef
-  const fadeTm      = useRef<ReturnType<typeof setInterval> | null>(null)
-
-  useEffect(() => { tracksRef.current = tracks }, [tracks])
-
-  const applyVol = () => {
-    const a = audioRef.current
-    if (a) a.volume = Math.min(1, Math.max(0, volumeRef.current * fadeRef.current))
-  }
-
-  const clearFadeTm = () => {
-    if (fadeTm.current !== null) { clearInterval(fadeTm.current); fadeTm.current = null }
-  }
-
-  const startFadeIn = (durationMs: number) => {
-    clearFadeTm()
-    fadeRef.current = 0
-    applyVol()
-    const steps = 40
-    const stepMs = durationMs / steps
-    let step = 0
-    fadeTm.current = setInterval(() => {
-      step++
-      fadeRef.current = Math.min(1, step / steps)
-      applyVol()
-      if (step >= steps) clearFadeTm()
-    }, stepMs)
-  }
-
-  const startFadeOutThen = (durationMs: number, cb: () => void) => {
-    clearFadeTm()
-    const start = fadeRef.current
-    const steps = 30
-    const stepMs = durationMs / steps
-    let step = 0
-    fadeTm.current = setInterval(() => {
-      step++
-      fadeRef.current = Math.max(0, start * (1 - step / steps))
-      applyVol()
-      if (step >= steps) { clearFadeTm(); cb() }
-    }, stepMs)
-  }
-
+  const currentIndex = order[orderPos] ?? 0
   const currentTrack = tracks[currentIndex] ?? null
 
+  // ── audio elements + graph ────────────────────────────────────────────────
+  const elA = useRef<HTMLAudioElement | null>(null)
+  const elB = useRef<HTMLAudioElement | null>(null)
+  const gainA = useRef<GainNode | null>(null)
+  const gainB = useRef<GainNode | null>(null)
+  const revokeA = useRef<() => void>(() => {})
+  const revokeB = useRef<() => void>(() => {})
+  const active = useRef<Side>('A')
+  const graphOk = useRef(false)
+  const crossfading = useRef(false)
+  const lastSaved = useRef(0)
+
+  // Mirrors for stable callbacks (never re-create handlers on every tick).
+  const tracksRef   = useRef<Track[]>([])
+  const orderRef    = useRef<number[]>([])
+  const orderPosRef = useRef(0)
+  const volumeRef   = useRef(0.7)
+  const shuffleRef  = useRef(false)
+  const categoryRef = useRef<Category | null>(null)
+  const playingRef  = useRef(false)
+  useEffect(() => { tracksRef.current = tracks },     [tracks])
+  useEffect(() => { orderRef.current = order },       [order])
+  useEffect(() => { orderPosRef.current = orderPos }, [orderPos])
+  useEffect(() => { shuffleRef.current = shuffle },   [shuffle])
+  useEffect(() => { playingRef.current = isPlaying }, [isPlaying])
+
+  const elFor   = (s: Side) => (s === 'A' ? elA.current : elB.current)
+  const gainFor = (s: Side) => (s === 'A' ? gainA.current : gainB.current)
+  const other   = (s: Side): Side => (s === 'A' ? 'B' : 'A')
+
+  /** Apply gain either through Web Audio (mobile-safe) or the element (fallback). */
+  const applyGain = useCallback((side: Side, value: number, seconds?: number) => {
+    const g = gainFor(side)
+    if (graphOk.current && g) {
+      if (seconds && seconds > 0) graph.rampGain(g, value, seconds)
+      else graph.setGain(g, value)
+      return
+    }
+    const el = elFor(side)   // no Web Audio: fall back to element volume (desktop)
+    if (el) el.volume = Math.min(1, Math.max(0, value * volumeRef.current))
+  }, [])
+
+  // Create the two elements once and wire them into the graph.
+  useEffect(() => {
+    const make = (): HTMLAudioElement => {
+      const el = new Audio()
+      el.preload = 'auto'
+      // REQUIRED: without CORS-clean media a MediaElementSource emits SILENCE
+      // (dev runs vite:5173 against api:3001). The API sends ACAO: *.
+      el.crossOrigin = 'anonymous'
+      return el
+    }
+    elA.current = make()
+    elB.current = make()
+    try {
+      if (graph.isSupported()) {
+        gainA.current = graph.attach(elA.current)
+        gainB.current = graph.attach(elB.current)
+        graphOk.current = true
+        graph.setMasterVolume(volumeRef.current)
+      }
+    } catch {
+      graphOk.current = false   // degrade to element volume; music still plays
+    }
+    applyGain('A', 0)
+    applyGain('B', 0)
+
+    // iOS starts the context suspended and only resumes inside a gesture.
+    const kick = () => { void graph.resume() }
+    window.addEventListener('pointerdown', kick, { once: true })
+    window.addEventListener('keydown', kick, { once: true })
+
+    return () => {
+      window.removeEventListener('pointerdown', kick)
+      window.removeEventListener('keydown', kick)
+      elA.current?.pause(); elB.current?.pause()
+      revokeA.current(); revokeB.current()
+    }
+  }, [applyGain])
+
+  // ── queue loading ─────────────────────────────────────────────────────────
   const loadTracks = useCallback(async (category: Category): Promise<Track[]> => {
     const res = await fetch(`${API_BASE}/tracks?category=${category}`, { headers: authHeaders(token) })
     if (!res.ok) throw new Error(`Server error: ${res.status}`)
@@ -102,30 +164,85 @@ export function usePlayer() {
     return data.map(t => ({ ...t, src: resolveSrc(t.src, token) }))
   }, [token])
 
-  // Initial fetch — load tracks for the user's current allowed category
+  /** Put a track into one side, preferring the offline cache. */
+  const loadInto = useCallback(async (side: Side, track: Track) => {
+    const el = elFor(side)
+    if (!el) return
+    const { src, revoke } = await cache.playableUrl(track.src)
+    // blob: URLs are same-origin — crossOrigin must be cleared or Safari refuses.
+    el.crossOrigin = src.startsWith('blob:') ? null : 'anonymous'
+    if (side === 'A') { revokeA.current(); revokeA.current = revoke } else { revokeB.current(); revokeB.current = revoke }
+    el.src = src
+    el.load()
+  }, [])
+
+  /** Cache the next few tracks in the background (never blocks playback). */
+  const preloadAhead = useCallback((fromPos: number) => {
+    const ord = orderRef.current, ts = tracksRef.current
+    if (!ord.length) return
+    const urls: string[] = []
+    for (let i = 1; i <= PRELOAD_AHEAD; i++) {
+      const t = ts[ord[(fromPos + i) % ord.length]]
+      if (t) urls.push(t.src)
+    }
+    void cache.preload(urls)
+  }, [])
+
+  // ── initial fetch (+ restore of the saved session) ────────────────────────
   useEffect(() => {
     const cat = pickInitial(allowed)
     if (!token || !cat) { setTracks([]); setLoading(false); return }
-    categoryRef.current = cat
     let cancelled = false
     setLoading(true)
-    loadTracks(cat)
-      .then(t => { if (!cancelled) { setTracks(t); setCurrentIndex(0); setLoading(false) } })
+    const saved = loadSession(user?.username)
+    const startCat = (saved && allowed.includes(saved.category as Category) ? saved.category : cat) as Category
+    categoryRef.current = startCat
+    loadTracks(startCat)
+      .then(list => {
+        if (cancelled) return
+        const startIdx = saved ? Math.max(0, list.findIndex(t => t.filename === saved.filename)) : 0
+        const useShuffle = saved?.shuffle ?? false
+        const ord = useShuffle ? shuffledOrder(list.length, startIdx) : identityOrder(list.length)
+        setTracks(list)
+        setShuffle(useShuffle)
+        setOrder(ord)
+        setOrderPos(Math.max(0, ord.indexOf(startIdx)))
+        setLoading(false)
+        // Restore the exact position; playback stays paused until the user taps
+        // (browsers block un-gestured autoplay anyway).
+        if (saved && list[startIdx]) {
+          void loadInto(active.current, list[startIdx]).then(() => {
+            const el = elFor(active.current)
+            if (el && saved.position > 0) {
+              const seekTo = () => { try { el.currentTime = saved.position } catch { /* ignore */ } }
+              if (el.readyState >= 1) seekTo()
+              else el.addEventListener('loadedmetadata', seekTo, { once: true })
+              setCurrentTime(saved.position)
+            }
+          })
+        } else if (list[0]) {
+          // Fresh start: prime the active element's src NOW so the first Play tap
+          // can call play() synchronously inside the gesture — an async load
+          // between the tap and play() is what iOS treats as losing the gesture.
+          void loadInto(active.current, list[0])
+        }
+      })
       .catch(e => { if (!cancelled) { setError(String(e)); setLoading(false) } })
     return () => { cancelled = true }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token, allowedKey, loadTracks])
 
-  // Time-of-day auto rotation: check every minute; swap queue when the period
-  // changes AND the user is allowed that category.
+  // Time-of-day rotation: swap the queue when the slot changes.
   useEffect(() => {
     const id = setInterval(() => {
       const newCat = getTimeCategory()
       if (allowed.includes(newCat) && newCat !== categoryRef.current) {
         categoryRef.current = newCat
-        loadTracks(newCat).then(newTracks => {
-          setTracks(newTracks)
-          setCurrentIndex(0)
+        loadTracks(newCat).then(list => {
+          setTracks(list)
+          const ord = shuffleRef.current ? shuffledOrder(list.length) : identityOrder(list.length)
+          setOrder(ord)
+          setOrderPos(0)
         }).catch(() => {})
       }
     }, 60_000)
@@ -133,94 +250,248 @@ export function usePlayer() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [allowedKey, loadTracks])
 
-  // Sync user volume — respect current fade multiplier
-  useEffect(() => { volumeRef.current = volume; applyVol() }, [volume])
+  // ── volume ────────────────────────────────────────────────────────────────
+  const setVolume = useCallback((v: number) => {
+    const value = Math.min(1, Math.max(0, v))
+    volumeRef.current = value
+    setVolumeState(value)
+    // The whole point of the Web Audio graph: iOS/Android ignore el.volume.
+    if (graphOk.current) graph.setMasterVolume(value)
+    else { const el = elFor(active.current); if (el) el.volume = value }
+  }, [])
 
-  // Wire audio events once
+  // ── one-time iOS unlock ─────────────────────────────────────────────────────
+  // iOS Safari blesses an <audio> element for *programmatic* playback only after
+  // it has been .play()'d inside a user gesture. The idle crossfade element (B)
+  // otherwise stays locked forever: the gapless switch silently fails and the
+  // main Play/Pause button is left driving a permanently-paused element — the
+  // "works exactly once" bug. Prime BOTH elements on the first gesture.
+  // `warming` suppresses the play/pause events this priming emits so the UI
+  // never flickers; it is awaited fully so the real play() that follows can
+  // never race the priming pause().
+  const hasInteracted = useRef(false)
+  const warming       = useRef(false)
+  const warmUp = useCallback(async () => {
+    if (hasInteracted.current) return
+    hasInteracted.current = true
+    warming.current = true
+    await Promise.all([elA.current, elB.current].map(async el => {
+      if (!el) return
+      // No src / autoplay-blocked → play() rejects, but the element is still
+      // blessed for the rest of the session, which is all we need.
+      try { await el.play(); el.pause() } catch { /* ignore */ }
+    }))
+    warming.current = false
+  }, [])
+
+  // ── switching ─────────────────────────────────────────────────────────────
+  /** Start `pos` on the idle side and cross-fade to it over `seconds`. */
+  const switchTo = useCallback(async (pos: number, seconds: number) => {
+    const ord = orderRef.current, ts = tracksRef.current
+    if (!ord.length) return
+    const nextPos = ((pos % ord.length) + ord.length) % ord.length
+    const track = ts[ord[nextPos]]
+    if (!track) return
+
+    const from = active.current
+    const to   = other(from)
+    try {
+      await loadInto(to, track)
+      const elTo = elFor(to)
+      if (!elTo) return
+
+      await graph.resume()
+      await warmUp()                 // bless both elements if this is the first gesture
+      applyGain(to, 0)
+      try { await elTo.play() } catch (e) {
+        // AbortError = play() interrupted by a fast switch/reload — harmless.
+        if ((e as DOMException)?.name !== 'AbortError') { /* gesture required — stays paused */ }
+      }
+
+      applyGain(to, 1, seconds)
+      applyGain(from, 0, seconds)
+
+      active.current = to
+      setOrderPos(nextPos)
+      orderPosRef.current = nextPos
+      setCurrentTime(0)
+      setDuration(isFinite(elTo.duration) ? elTo.duration : 0)
+
+      const elFrom = elFor(from)
+      window.setTimeout(() => { try { elFrom?.pause(); if (elFrom) elFrom.currentTime = 0 } catch { /* ignore */ } },
+        Math.ceil(seconds * 1000) + 60)
+
+      preloadAhead(nextPos)
+    } finally {
+      crossfading.current = false    // never wedge the auto-crossfade trigger, even on a throw
+    }
+  }, [applyGain, loadInto, preloadAhead, warmUp])
+
+  const next = useCallback(() => { void switchTo(orderPosRef.current + 1, SWITCH_SEC) }, [switchTo])
+  const prev = useCallback(() => { void switchTo(orderPosRef.current - 1, SWITCH_SEC) }, [switchTo])
+  const selectTrack = useCallback((index: number) => {
+    const at = orderRef.current.indexOf(index)
+    void switchTo(at >= 0 ? at : 0, SWITCH_SEC)
+  }, [switchTo])
+
+  // ── play / pause ──────────────────────────────────────────────────────────
+  // NOTE: this handler NEVER calls setIsPlaying itself. The UI is bound strictly
+  // to the elements' native 'play'/'playing'/'pause' events (see the effect
+  // below), so the icon always mirrors what audio is really doing — even when
+  // iOS silently refuses a play(). That is what keeps the button alive forever.
+  const togglePlay = useCallback(() => {
+    if (playingRef.current) {
+      // Pause: just pause — the native 'pause' event flips the UI.
+      elFor(active.current)?.pause()
+      return
+    }
+    // Play: everything below must stay inside this user gesture for iOS.
+    void (async () => {
+      await graph.resume()          // resumes the ctx iff suspended — required on iOS
+      await warmUp()                // one-time: bless BOTH <audio> elements this session
+      const el = elFor(active.current)
+      if (!el) return
+      const ts = tracksRef.current, ord = orderRef.current
+      if (!el.src && ts.length) await loadInto(active.current, ts[ord[orderPosRef.current] ?? 0])
+      applyGain(active.current, 1)
+      try {
+        await el.play()             // UI flips via the 'play' event, not here
+      } catch (e) {
+        // AbortError = play() interrupted by a quick pause()/reload — harmless.
+        // Any other rejection: the element stays paused and the absence of a
+        // 'play' event keeps the UI truthful, so no manual state juggling.
+        if ((e as DOMException)?.name !== 'AbortError') { /* stays paused */ }
+      }
+    })()
+  }, [applyGain, loadInto, warmUp])
+
+  // ── per-element events: progress, crossfade trigger, safety net ───────────
   useEffect(() => {
-    const audio = audioRef.current!
-    const onTime = () => setCurrentTime(audio.currentTime)
-    const onDuration = () => setDuration(isFinite(audio.duration) ? audio.duration : 0)
-    const onEnded = () => setCurrentIndex(i => (i + 1) % (tracksRef.current.length || 1))
+    const sides: Side[] = ['A', 'B']
+    const offs: (() => void)[] = []
 
-    audio.addEventListener('timeupdate', onTime)
-    audio.addEventListener('durationchange', onDuration)
-    audio.addEventListener('ended', onEnded)
+    for (const side of sides) {
+      const el = elFor(side)
+      if (!el) continue
+
+      const onTime = () => {
+        if (active.current !== side) return           // the fading-out side is ignored
+        setCurrentTime(el.currentTime)
+        const dur = el.duration
+        if (isFinite(dur) && dur > 0) {
+          // Start the next track before this one ends → no silence.
+          const fade = Math.min(CROSSFADE_SEC, dur / 3)
+          if (!crossfading.current && dur - el.currentTime <= fade && orderRef.current.length > 0) {
+            crossfading.current = true
+            void switchTo(orderPosRef.current + 1, fade)
+          }
+          // Throttled resume-point.
+          const now = Date.now()
+          if (now - lastSaved.current > SAVE_EVERY_MS) {
+            lastSaved.current = now
+            const t = tracksRef.current[orderRef.current[orderPosRef.current]]
+            if (t && user?.username) {
+              saveSession({ username: user.username, category: categoryRef.current ?? '', filename: t.filename, position: el.currentTime, shuffle: shuffleRef.current })
+            }
+          }
+          ms.setPositionState(dur, el.currentTime)
+        }
+      }
+      const onDur = () => { if (active.current === side) setDuration(isFinite(el.duration) ? el.duration : 0) }
+      // Safety net: if the crossfade never fired (unknown duration, stalled), keep going.
+      // Safety net: the faded-OUT element also fires 'ended' (it plays to its
+      // natural end behind the crossfade) — ignore it, `active` already moved on.
+      // Only an 'ended' on the ACTIVE side means the crossfade never ran.
+      const onEnded = () => { if (active.current === side) { crossfading.current = false; void switchTo(orderPosRef.current + 1, SWITCH_SEC) } }
+      // UI state is driven STRICTLY by the element's own events, so the icon can
+      // never disagree with what audio is actually doing (even when iOS refuses a
+      // play()). `warming` skips the one-time unlock priming; the `active` check
+      // ignores the faded-OUT side. No `crossfading` gate — a mid-crossfade throw
+      // must never be able to wedge the pause state.
+      const onPlay  = () => { if (!warming.current && active.current === side) setIsPlaying(true) }
+      const onPause = () => { if (!warming.current && active.current === side) setIsPlaying(false) }
+
+      el.addEventListener('timeupdate', onTime)
+      el.addEventListener('durationchange', onDur)
+      el.addEventListener('ended', onEnded)
+      el.addEventListener('play', onPlay)
+      el.addEventListener('playing', onPlay)
+      el.addEventListener('pause', onPause)
+      offs.push(() => {
+        el.removeEventListener('timeupdate', onTime)
+        el.removeEventListener('durationchange', onDur)
+        el.removeEventListener('ended', onEnded)
+        el.removeEventListener('play', onPlay)
+        el.removeEventListener('playing', onPlay)
+        el.removeEventListener('pause', onPause)
+      })
+    }
+    return () => { for (const off of offs) off() }
+  }, [switchTo, user?.username])
+
+  // ── lock-screen controls + metadata ───────────────────────────────────────
+  useEffect(() => {
+    ms.setHandlers({
+      play:  () => { if (!playingRef.current) togglePlay() },
+      pause: () => { if (playingRef.current) togglePlay() },
+      next,
+      prev,
+    })
+    return () => ms.clearHandlers()
+  }, [togglePlay, next, prev])
+
+  useEffect(() => { ms.setMetadata(currentTrack) }, [currentTrack])
+  useEffect(() => { ms.setPlaybackState(isPlaying) }, [isPlaying])
+
+  // ── persist the resume point on background / unload ───────────────────────
+  useEffect(() => {
+    const persist = () => {
+      const el = elFor(active.current)
+      const t  = tracksRef.current[orderRef.current[orderPosRef.current]]
+      if (el && t && user?.username) {
+        saveSession({ username: user.username, category: categoryRef.current ?? '', filename: t.filename, position: el.currentTime, shuffle: shuffleRef.current })
+      }
+    }
+    const onVis = () => { if (document.visibilityState === 'hidden') persist() }
+    window.addEventListener('pagehide', persist)
+    document.addEventListener('visibilitychange', onVis)
     return () => {
-      audio.removeEventListener('timeupdate', onTime)
-      audio.removeEventListener('durationchange', onDuration)
-      audio.removeEventListener('ended', onEnded)
+      window.removeEventListener('pagehide', persist)
+      document.removeEventListener('visibilitychange', onVis)
+      persist()
     }
-  }, [])
+  }, [user?.username])
 
-  // Load src when track changes — reset fade to 0, fade-in triggered by play effect
-  useEffect(() => {
-    if (!currentTrack) return
-    clearFadeTm()
-    fadeRef.current = 0
-    applyVol()
-    audioRef.current!.src = currentTrack.src
-    setCurrentTime(0)
-    setDuration(0)
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentTrack?.id])
+  // Cache the upcoming tracks as soon as a queue exists.
+  useEffect(() => { if (tracks.length) preloadAhead(orderPos) }, [tracks, orderPos, preloadAhead])
 
-  // Sync play / pause state — fade in on play, no fade on unpause
-  useEffect(() => {
-    if (!currentTrack) return
-    const audio = audioRef.current!
-    if (isPlaying) {
-      if (fadeRef.current < 0.05) startFadeIn(FADE_MS)   // new track: fade in
-      const p = audio.play()
-      if (p) p.catch(() => setIsPlaying(false))
-    } else {
-      audio.pause()
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isPlaying, currentTrack?.id])
-
-  const togglePlay = useCallback(() => setIsPlaying(v => !v), [])
-
-  const next = useCallback(() => {
-    startFadeOutThen(FADE_MS * 0.6, () => {
-      setCurrentIndex(i => (i + 1) % (tracksRef.current.length || 1))
-      setIsPlaying(true)
+  // ── public actions ────────────────────────────────────────────────────────
+  const toggleShuffle = useCallback(() => {
+    setShuffle(prevOn => {
+      const on = !prevOn
+      shuffleRef.current = on
+      const cur = orderRef.current[orderPosRef.current] ?? 0
+      const ord = on ? shuffledOrder(tracksRef.current.length, cur) : identityOrder(tracksRef.current.length)
+      setOrder(ord)
+      setOrderPos(Math.max(0, ord.indexOf(cur)))
+      return on
     })
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
-  const prev = useCallback(() => {
-    startFadeOutThen(FADE_MS * 0.6, () => {
-      setCurrentIndex(i => (i - 1 + (tracksRef.current.length || 1)) % (tracksRef.current.length || 1))
-      setIsPlaying(true)
-    })
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const seek = useCallback((ratio: number) => {
-    const audio = audioRef.current!
-    if (isFinite(audio.duration) && audio.duration > 0) {
-      audio.currentTime = ratio * audio.duration
-    }
+    const el = elFor(active.current)
+    if (el && isFinite(el.duration) && el.duration > 0) el.currentTime = ratio * el.duration
   }, [])
 
-  const selectTrack = useCallback((index: number) => {
-    startFadeOutThen(FADE_MS * 0.6, () => {
-      setCurrentIndex(index)
-      setIsPlaying(true)
-    })
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
-  // Replace the entire queue with new tracks and start playing at targetIndex
   const replaceQueueAndPlay = useCallback((newTracks: Track[], targetIndex: number) => {
-    startFadeOutThen(FADE_MS * 0.6, () => {
-      setTracks(newTracks)
-      setCurrentIndex(targetIndex)
-      setIsPlaying(true)
-    })
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+    tracksRef.current = newTracks
+    const ord = shuffleRef.current ? shuffledOrder(newTracks.length, targetIndex) : identityOrder(newTracks.length)
+    orderRef.current = ord
+    setTracks(newTracks)
+    setOrder(ord)
+    const pos = Math.max(0, ord.indexOf(targetIndex))
+    void switchTo(pos, SWITCH_SEC)   // the new side's 'play' event sets isPlaying
+  }, [switchTo])
 
   return {
     tracks,
@@ -239,5 +510,7 @@ export function usePlayer() {
     selectTrack,
     volume,
     setVolume,
+    shuffle,
+    toggleShuffle,
   }
 }

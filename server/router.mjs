@@ -12,7 +12,7 @@ import {
 } from './config.mjs'
 import { hashPassword, verifyPassword, signToken, generatePassword, DECOY } from './crypto.mjs'
 import {
-  getUsers, findUser, addUser, setUsers, saveUsers, sanitize, cleanCats,
+  getUsers, findUser, addUser, setUsers, saveUsers, sanitize, cleanCats, readFlags,
 } from './users.mjs'
 import {
   safeDecode, safeSegment, folderPath, listFolderIds, folderExists,
@@ -25,7 +25,8 @@ import {
 } from './http.mjs'
 import { handleUpload, handleClassifyUpload } from './uploads.mjs'
 import {
-  getBatch, deleteBatch, persistBatches, runClassify, normalizeCat, uniqueName, moveFile, batchView,
+  getBatch, deleteBatch, persistBatches, runClassify, normalizeCat, claimName, moveFile, batchView,
+  purgeStagingDir,
 } from './classify.mjs'
 
 /** @typedef {import('node:http').IncomingMessage} IncomingMessage */
@@ -113,7 +114,14 @@ export async function handleRequest(req, res) {
       const role = body.role === 'admin' ? 'admin' : 'user'
       const folderId = body.folderId ? safeSegment(body.folderId) : null
       if (body.folderId && !folderExists(folderId)) return json(res, { error: 'Folder not found' }, 400)
-      const newUser = { username, role, categories: cleanCats(body.categories), folderId, ...hashPassword(body.password) }
+      // Feature flags default to true when absent (opt-out, not opt-in).
+      const flags = readFlags(body)
+      const newUser = {
+        username, role, categories: cleanCats(body.categories), folderId,
+        allowFolderSelector: flags.allowFolderSelector ?? true,
+        allowShuffle: flags.allowShuffle ?? true,
+        ...hashPassword(body.password),
+      }
       addUser(newUser)
       await saveUsers()
       return json(res, sanitize(newUser), 201)
@@ -131,6 +139,9 @@ export async function handleRequest(req, res) {
           name:     owner?.name ?? folderId,
           username: owner?.username ?? null,
           singlePlaylist: owner?.singlePlaylist === true,
+          // Same opt-out normalisation as sanitize(): missing → true.
+          allowFolderSelector: owner?.allowFolderSelector !== false,
+          allowShuffle: owner?.allowShuffle !== false,
           counts,
           sizeBytes,
         }
@@ -154,15 +165,20 @@ export async function handleRequest(req, res) {
       } catch (e) {
         return json(res, { error: `Не удалось создать папку: ${/** @type {Error} */ (e).message}` }, 500)
       }
+      // Feature flags default to true when absent (opt-out, not opt-in).
+      const flags = readFlags(body)
+      const allowFolderSelector = flags.allowFolderSelector ?? true
+      const allowShuffle = flags.allowShuffle ?? true
       const newUser = {
         username, name, role: 'user',
         categories: singlePlaylist ? [ALL_CATEGORY] : [...CATEGORIES],
         folderId, singlePlaylist,
+        allowFolderSelector, allowShuffle,
         ...hashPassword(password),
       }
       addUser(newUser)
       await saveUsers()
-      return json(res, { folderId, name, username, password, singlePlaylist }, 201)
+      return json(res, { folderId, name, username, password, singlePlaylist, allowFolderSelector, allowShuffle }, 201)
     }
 
     // POST /admin/clients/:folderId/reset-password
@@ -237,7 +253,7 @@ export async function handleRequest(req, res) {
       const destDir = path.join(folderPath(toFolderId), toCategory)
       try {
         fs.mkdirSync(destDir, { recursive: true })
-        const finalName = uniqueName(destDir, filename)
+        const finalName = claimName(destDir, filename)
         moveFile(srcPath, path.join(destDir, finalName))
         return json(res, { ok: true, filename: finalName, folderId: toFolderId, category: toCategory })
       } catch (e) {
@@ -297,6 +313,8 @@ export async function handleRequest(req, res) {
           target.weakPassword = target.role === 'admin' && String(body.password) === 'admin'
         }
         if (Array.isArray(body.categories)) target.categories = cleanCats(body.categories)
+        // Only keys present as booleans are applied; absent keys keep the stored value.
+        Object.assign(target, readFlags(body))
         if ('folderId' in body) {
           const fid = body.folderId ? safeSegment(body.folderId) : null
           if (body.folderId && !folderExists(fid)) return json(res, { error: 'Folder not found' }, 400)
@@ -342,12 +360,16 @@ export async function handleRequest(req, res) {
       const leftover = []   // tracks that failed to move — keep them staged for a retry
       for (const t of batch.tracks) {
         const cat = normalizeCat(t.override ?? t.category)
-        const src = path.join(stageDir, t.filename)
+        // The filename comes from the classifier's JSON — re-check it here so a
+        // malformed/hostile entry ('..', a path) can never escape the staging dir.
+        const stagedName = safeSegment(t.filename)
+        if (!stagedName) { errors.push({ filename: String(t.filename), error: 'недопустимое имя файла' }); leftover.push(t); continue }
+        const src = path.join(stageDir, stagedName)
         try {
           if (!fs.existsSync(src)) { errors.push({ filename: t.filename, error: 'файл отсутствует в staging' }); continue }
           const destDir = path.join(folderPath(batch.folderId), cat)
           fs.mkdirSync(destDir, { recursive: true })
-          const finalName = uniqueName(destDir, t.filename)
+          const finalName = claimName(destDir, stagedName)
           moveFile(src, path.join(destDir, finalName))
           moved.push({ filename: finalName, category: cat })
         } catch (e) {
@@ -358,7 +380,7 @@ export async function handleRequest(req, res) {
 
       if (errors.length === 0) {
         // Full success → purge staging, drop the batch.
-        try { fs.rmSync(stageDir, { recursive: true, force: true }) } catch { /* best effort */ }
+        purgeStagingDir(batch.batchId)
         deleteBatch(batch.batchId)
       } else {
         // Partial success → keep the batch (only the failed tracks remain) so the
@@ -413,8 +435,16 @@ export async function handleRequest(req, res) {
       }
       if (req.method === 'POST') {   // retry on the already-staged files
         if (!batch) return json(res, { error: 'Batch not found' }, 404)
-        if (batch.status !== 'error' && batch.status !== 'ready') {
-          return json(res, { error: 'Классификация уже идёт' }, 409)
+        // Only a failed batch may be re-run. Re-classifying a 'ready' batch would
+        // overwrite batch.tracks and silently discard every manual override the
+        // admin had already set (the spec allows a re-run only when the status is
+        // neither 'classifying' nor 'ready').
+        if (batch.status !== 'error') {
+          return json(res, {
+            error: batch.status === 'ready'
+              ? 'Батч уже классифицирован — отмените его, чтобы запустить заново'
+              : 'Классификация уже идёт',
+          }, 409)
         }
         runClassify(batch)
         return json(res, { batchId: batch.batchId, status: 'classifying' }, 202)
@@ -422,7 +452,10 @@ export async function handleRequest(req, res) {
       if (req.method === 'DELETE') {   // cancel at any stage
         if (!batch) return json(res, { error: 'Batch not found' }, 404)
         batch.canceled = true
-        try { fs.rmSync(path.join(INCOMING_DIR, batch.batchId), { recursive: true, force: true }) } catch { /* may be held by python on win — swept on next boot */ }
+        // Kills the classifier first (else librosa keeps reading the very files
+        // we delete, and on Windows its handles make the removal fail), then
+        // retries the removal a few times before giving up to the boot sweep.
+        purgeStagingDir(batch.batchId)
         deleteBatch(batch.batchId)
         persistBatches()
         return json(res, { ok: true })

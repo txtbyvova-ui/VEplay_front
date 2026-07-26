@@ -2,12 +2,22 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import type { ClientInfo, ClientCredentials, AdminTrack } from '../../api'
 import {
   API_BASE, CATEGORIES, resolveSrc, deleteClient, resetClientPassword,
-  getClientTracks, deleteTrack, uploadTracks, classifyFolder, moveTrack,
+  getClientTracks, deleteTrack, uploadTracks, uploadRejectText, classifyFolder, moveTrack,
+  updateUser,
 } from '../../api'
+import type { UserPatch } from '../../api'
 import { card, btn, btnDanger, chip, mono, catLabel } from '../adminStyles'
 import ClassifyBatch from '../ClassifyBatch'
 import ClientTrackRow from './ClientTrackRow'
 import MovePopover from './MovePopover'
+
+/** Russian plural: 1 трек / 2 трека / 5 треков. */
+function plural(n: number, one: string, few: string, many: string): string {
+  const mod10 = n % 10, mod100 = n % 100
+  if (mod10 === 1 && mod100 !== 11) return one
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return few
+  return many
+}
 
 function fmtSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
@@ -38,6 +48,8 @@ export default function ClientCard({ client, allClients, token, onChanged, onCre
   // classify-folder flow
   const [classifyProgress, setClassifyProgress] = useState<number | null>(null)
   const [batchId, setBatchId] = useState<string | null>(null)
+  const [batchCount, setBatchCount] = useState<number>(0)   // files the upload accepted
+  const [notice, setNotice] = useState<string | null>(null)
   const dirInput = useRef<HTMLInputElement>(null)
   // webkitdirectory/directory are non-standard input attributes not in the DOM types;
   // set them via setAttribute (fully typed) instead of a cast or @ts-expect-error.
@@ -67,7 +79,8 @@ export default function ClientCard({ client, allClients, token, onChanged, onCre
     try {
       const result = await uploadTracks(token, client.folderId, uploadCat, files, setProgress)
       if (result.rejected.length) {
-        onError(result.rejected.map(r => `${r.filename}: ${r.reason}`).join(' · '))
+        const list = result.rejected.map(r => `«${r.filename}» — ${uploadRejectText(r.reason)}`).join(' · ')
+        onError(`Загружено ${result.accepted.length}, отклонено ${result.rejected.length}: ${list}`)
       }
       onChanged()
       if (expanded) await loadTracks()
@@ -105,6 +118,7 @@ export default function ClientCard({ client, allClients, token, onChanged, onCre
       if (res.skipped?.length) {
         onError(`Пропущено файлов: ${res.skipped.length} — ${res.skipped.join(' · ')}`)
       }
+      setBatchCount(res.uploaded ?? mp3s.length)
       setBatchId(res.batchId)
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e))
@@ -170,6 +184,19 @@ export default function ClientCard({ client, allClients, token, onChanged, onCre
     catch (e) { onError(e instanceof Error ? e.message : String(e)) }
   }
 
+  // Per-client feature flags. Sends only the toggled key so the other one is left
+  // untouched server-side; the parent refresh re-reads the persisted value.
+  const [flagBusy, setFlagBusy] = useState(false)
+  const toggleFlag = async (patch: UserPatch) => {
+    if (!client.username || flagBusy) return
+    setFlagBusy(true)
+    try {
+      await updateUser(token, client.username, patch)
+      onChanged()
+    } catch (e) { onError(e instanceof Error ? e.message : String(e)) }
+    finally { setFlagBusy(false) }
+  }
+
   const remove = async () => {
     if (!confirm(`Удалить клиента «${client.name}»?\n\nПапка ${client.folderId} со ВСЕЙ музыкой и пользователь ${client.username ?? ''} будут удалены безвозвратно.`)) return
     try { await deleteClient(token, client.folderId); onChanged() }
@@ -206,6 +233,25 @@ export default function ClientCard({ client, allClients, token, onChanged, onCre
         <span>Размер: <b style={{ color: '#fff' }}>{fmtSize(client.sizeBytes)}</b></span>
       </div>
 
+      {/* per-client feature flags — only meaningful for a client that has a login */}
+      {client.username && (
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 12, color: 'rgba(255,255,255,0.45)' }}>Доступно клиенту:</span>
+          <span
+            style={{ ...chip(client.allowFolderSelector), opacity: flagBusy ? 0.5 : 1 }}
+            onClick={() => toggleFlag({ allowFolderSelector: !client.allowFolderSelector })}
+          >
+            {client.allowFolderSelector ? '✓' : '✕'} Переключатель категорий
+          </span>
+          <span
+            style={{ ...chip(client.allowShuffle), opacity: flagBusy ? 0.5 : 1 }}
+            onClick={() => toggleFlag({ allowShuffle: !client.allowShuffle })}
+          >
+            {client.allowShuffle ? '✓' : '✕'} Шафл
+          </span>
+        </div>
+      )}
+
       {/* upload zone */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
         {cats.length > 1 && (
@@ -236,11 +282,11 @@ export default function ClientCard({ client, allClients, token, onChanged, onCre
               </div>
             </div>
           ) : (
-            <>Перетащите mp3 сюда или нажмите (в «{catLabel(uploadCat)}», до 20MB на файл)</>
+            <>Перетащите аудио сюда или нажмите (в «{catLabel(uploadCat)}», до 200 МБ на файл)</>
           )}
         </div>
         <input
-          ref={fileInput} type="file" accept=".mp3,audio/mpeg" multiple style={{ display: 'none' }}
+          ref={fileInput} type="file" accept=".mp3,.wav,.flac,.m4a,.aac,.ogg,.opus,audio/*" multiple style={{ display: 'none' }}
           onChange={e => { doUpload(Array.from(e.target.files ?? [])); e.target.value = '' }}
         />
         {/* Auto-classify a whole folder (time-of-day clients only). */}
@@ -260,6 +306,18 @@ export default function ClientCard({ client, allClients, token, onChanged, onCre
           </div>
         )}
       </div>
+
+      {/* success line after a classify batch is applied */}
+      {notice && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 10, fontSize: 13,
+          color: '#7ddc9a', border: '1px solid rgba(125,220,154,0.3)',
+          background: 'rgba(125,220,154,0.08)', borderRadius: 10, padding: '8px 12px',
+        }}>
+          <span style={{ flex: 1 }}>✓ {notice}</span>
+          <button style={{ ...btn, padding: '2px 8px', fontSize: 12 }} onClick={() => setNotice(null)}>✕</button>
+        </div>
+      )}
 
       {/* track list */}
       <button style={{ ...btn, alignSelf: 'flex-start' }} onClick={() => setExpanded(v => !v)}>
@@ -324,9 +382,15 @@ export default function ClientCard({ client, allClients, token, onChanged, onCre
           batchId={batchId}
           folderId={client.folderId}
           token={token}
+          expectedCount={batchCount}
           onError={onError}
           onClose={() => setBatchId(null)}
-          onDone={() => { setBatchId(null); onChanged(); if (expanded) loadTracks() }}
+          onDone={(moved) => {
+            setBatchId(null)
+            setNotice(`Готово: ${moved} ${plural(moved, 'трек', 'трека', 'треков')} разложено по папкам`)
+            onChanged()
+            if (expanded) loadTracks()
+          }}
         />
       )}
     </div>

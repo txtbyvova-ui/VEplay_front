@@ -9,7 +9,7 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "check:server": "tsc -p jsconfig.json",
-    "test:server": "node test/classify.routes.test.mjs && node test/upload_timeout.test.mjs",
+    "test:server": "node test/classify.routes.test.mjs && node test/upload_timeout.test.mjs && node test/recovery.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

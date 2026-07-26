@@ -32,6 +32,7 @@ const mp3 = (label) => new Blob([new Uint8Array([0x49, 0x44, 0x33, 3, 0, 0, 0, 0
 
 async function main() {
   const PORT     = await freePort()
+  const PORT2    = await freePort()   // second server: re-reads users.json (legacy-flag case)
   const BASE     = `http://127.0.0.1:${PORT}`
   const tmp      = fs.mkdtempSync(path.join(os.tmpdir(), 've-classify-test-'))
   const MUSIC    = path.join(tmp, 'music')
@@ -227,6 +228,88 @@ async function main() {
     eq(bigUp.skipped.length, 0, '21MB mp3 not skipped')
     await api('DELETE', `/admin/classify/${bigUp.batchId}`, { token })
 
+    // ── audit fix: >MAX_BATCH_FILES files → 413, not a silent tail-drop ──
+    // busboy's `files` limit skipped the surplus parts with no per-file event, so
+    // the extra tracks vanished and `skipped` only carried one generic line.
+    const manyForm = new FormData()
+    for (let i = 1; i <= 505; i++) manyForm.append('tracks', mp3(`m${i}`), `M${String(i).padStart(3, '0')} - day.mp3`)
+    const manyRes = await fetch(`${BASE}/admin/clients/${folderId}/classify`, {
+      method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: manyForm,
+    })
+    eq(manyRes.status, 413, '505 files → 413 (not a silent drop)')
+    const manyBody = await manyRes.json().catch(() => null)
+    ok(typeof manyBody?.error === 'string' && manyBody.error.length > 0, '413 carries a readable error')
+    // Purge is asynchronous on purpose: every in-flight write stream is destroyed
+    // and awaited first, because on Windows rmSync fails on an open fd.
+    const incLeft = async () => {
+      for (let i = 0; i < 60; i++) {
+        const d = fs.existsSync(path.join(MUSIC, '_incoming')) ? fs.readdirSync(path.join(MUSIC, '_incoming')) : []
+        if (!d.length) return 0
+        await new Promise(r => setTimeout(r, 100))
+      }
+      return fs.readdirSync(path.join(MUSIC, '_incoming')).length
+    }
+    eq(await incLeft(), 0, '413 purges the staging dir (no orphan _incoming)')
+
+    // ── audit fix: an aborted upload must not leave staged files behind ──
+    // The batch is only registered once the upload finishes, so anything left in
+    // _incoming after an abort is unreachable via DELETE /admin/classify/:id.
+    await new Promise((resolve) => {
+      const BND = '----vetestboundary'
+      const sock = net.connect(PORT, '127.0.0.1', () => {
+        sock.write(
+          `POST /admin/clients/${folderId}/classify HTTP/1.1\r\nHost: 127.0.0.1:${PORT}\r\n` +
+          `Authorization: Bearer ${token}\r\nContent-Type: multipart/form-data; boundary=${BND}\r\n` +
+          `Content-Length: 99999999\r\nConnection: close\r\n\r\n`)
+        sock.write(`--${BND}\r\nContent-Disposition: form-data; name="tracks"; filename="Aborted - day.mp3"\r\n` +
+                   `Content-Type: audio/mpeg\r\n\r\n`)
+        sock.write(Buffer.alloc(512 * 1024, 0x41))
+        setTimeout(() => { sock.destroy(); resolve() }, 300)
+      })
+      sock.on('error', () => resolve())
+    })
+    await new Promise(r => setTimeout(r, 1500))
+    const afterAbort = fs.existsSync(path.join(MUSIC, '_incoming')) ? fs.readdirSync(path.join(MUSIC, '_incoming')) : []
+    eq(afterAbort.length, 0, 'aborted upload leaves no orphan staging dir')
+
+    // ── audit fix: a degraded classifier run is surfaced to the admin ──
+    // gemini_classifier swallows its own failure and returns chill/evening, so
+    // without this flag a dead Gemini is indistinguishable from a real result.
+    const degForm = new FormData()
+    degForm.append('tracks', mp3('d1'), 'DEGRADED - day.mp3')
+    const degUp = await (await fetch(`${BASE}/admin/clients/${folderId}/classify`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: degForm })).json()
+    let degBatch
+    for (let i = 0; i < 100; i++) {
+      degBatch = (await api('GET', `/admin/classify/${degUp.batchId}`, { token })).data
+      if (degBatch.status === 'ready' || degBatch.status === 'error') break
+      await new Promise(r => setTimeout(r, 100))
+    }
+    eq(degBatch.status, 'ready', 'degraded run still reaches ready')
+    ok(typeof degBatch.warning === 'string' && degBatch.warning.length > 0, 'degraded run exposes `warning` to the admin')
+
+    // ── audit fix: re-running a READY batch is refused (it would wipe overrides) ──
+    const ovPut = await api('PUT', `/admin/classify/${degUp.batchId}/track/${encodeURIComponent('DEGRADED - day.mp3')}`, { token, body: { category: 'morning' } })
+    eq(ovPut.status, 200, 'override set on ready batch')
+    const reRun = await api('POST', `/admin/classify/${degUp.batchId}`, { token })
+    eq(reRun.status, 409, 're-classify a ready batch → 409 (overrides preserved)')
+    const stillThere = (await api('GET', `/admin/classify/${degUp.batchId}`, { token })).data
+    eq(stillThere.tracks[0].override, 'morning', 'override survives the refused re-run')
+    eq(stillThere.status, 'ready', 'refused re-run leaves the batch ready')
+    await api('DELETE', `/admin/classify/${degUp.batchId}`, { token })
+
+    // ── a healthy run carries no warning (no false alarm in the UI) ──
+    const okForm = new FormData()
+    okForm.append('tracks', mp3('h1'), 'Healthy - day.mp3')
+    const okUp = await (await fetch(`${BASE}/admin/clients/${folderId}/classify`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: okForm })).json()
+    let okBatch
+    for (let i = 0; i < 100; i++) {
+      okBatch = (await api('GET', `/admin/classify/${okUp.batchId}`, { token })).data
+      if (okBatch.status === 'ready' || okBatch.status === 'error') break
+      await new Promise(r => setTimeout(r, 100))
+    }
+    ok(okBatch.warning === null || okBatch.warning === undefined, 'healthy run reports no warning')
+    await api('DELETE', `/admin/classify/${okUp.batchId}`, { token })
+
     // ── review fix #3: admin can stream a single-playlist ('all') track ──
     const spc = await api('POST', '/admin/clients', { token, body: { name: 'Single Bar', single_playlist: true } })
     const spFolder = spc.data.folderId
@@ -235,6 +318,93 @@ async function main() {
     fs.writeFileSync(path.join(allDir, 'X - track.mp3'), Buffer.from([0x49, 0x44, 0x33, 3, 0, 0, 0, 0, 0, 0]))
     const streamAll = await fetch(`${BASE}/music/${spFolder}/all/${encodeURIComponent('X - track.mp3')}?token=${encodeURIComponent(token)}`, { headers: { Range: 'bytes=0-' } })
     ok(streamAll.status === 200 || streamAll.status === 206, `admin streams single-playlist 'all' track (status ${streamAll.status})`)
+
+    // ── feature flags: allowFolderSelector / allowShuffle ─────────────────────
+    // Helper: read one user back out of GET /admin/users (a client's own /auth/me
+    // is unreachable — its generated password is only returned once, at create).
+    const getAdminUser = async (name) =>
+      (await api('GET', '/admin/users', { token })).data.find(u => u.username === name)
+
+    // 1. a fresh client defaults BOTH flags to true, in the 201 body and when read back
+    const ff = await api('POST', '/admin/clients', { token, body: { name: 'Flag Bar' } })
+    eq(ff.status, 201, 'flags: create client → 201')
+    eq(ff.data.allowFolderSelector, true, 'flags: POST /admin/clients 201 body → allowFolderSelector true')
+    eq(ff.data.allowShuffle, true, 'flags: POST /admin/clients 201 body → allowShuffle true')
+    const ffUser = ff.data.username
+    const ffRead = await getAdminUser(ffUser)
+    eq(ffRead.allowFolderSelector, true, 'flags: GET /admin/users → allowFolderSelector true by default')
+    eq(ffRead.allowShuffle, true, 'flags: GET /admin/users → allowShuffle true by default')
+    // the client list the admin UI renders from carries them too
+    const ffList = (await api('GET', '/admin/clients', { token })).data.find(c => c.folderId === ff.data.folderId)
+    eq(ffList.allowFolderSelector, true, 'flags: GET /admin/clients → allowFolderSelector true by default')
+    eq(ffList.allowShuffle, true, 'flags: GET /admin/clients → allowShuffle true by default')
+
+    // 2. PUT one flag false → persists; the untouched flag stays true
+    const ffPut = await api('PUT', `/admin/users/${encodeURIComponent(ffUser)}`, { token, body: { allowShuffle: false } })
+    eq(ffPut.status, 200, 'flags: PUT allowShuffle=false → 200')
+    eq(ffPut.data.allowShuffle, false, 'flags: PUT response → allowShuffle false')
+    eq(ffPut.data.allowFolderSelector, true, 'flags: PUT response → allowFolderSelector untouched (true)')
+    const ffAfter = await getAdminUser(ffUser)
+    eq(ffAfter.allowShuffle, false, 'flags: GET /admin/users → allowShuffle false persisted')
+    eq(ffAfter.allowFolderSelector, true, 'flags: GET /admin/users → allowFolderSelector still true')
+    // and it survives a users.json round-trip on disk
+    const onDisk = JSON.parse(fs.readFileSync(path.join(DATA, 'users.json'), 'utf8'))
+      .users.find(u => u.username === ffUser)
+    eq(onDisk.allowShuffle, false, 'flags: users.json on disk → allowShuffle false')
+
+    // an unrelated PUT (password only) must not resurrect or clear the flags
+    await api('PUT', `/admin/users/${encodeURIComponent(ffUser)}`, { token, body: { password: 'newpass123' } })
+    const ffPw = await getAdminUser(ffUser)
+    eq(ffPw.allowShuffle, false, 'flags: unrelated PUT leaves allowShuffle false')
+    eq(ffPw.allowFolderSelector, true, 'flags: unrelated PUT leaves allowFolderSelector true')
+
+    // a non-boolean value is ignored (not coerced) — the stored value stands
+    await api('PUT', `/admin/users/${encodeURIComponent(ffUser)}`, { token, body: { allowShuffle: 'yes' } })
+    eq((await getAdminUser(ffUser)).allowShuffle, false, 'flags: non-boolean PUT value ignored')
+
+    // 3. POST /admin/users honours explicit flags, and defaults to true when absent
+    await api('POST', '/admin/users', { token, body: { username: 'flaguser', password: 'flagpass12', allowFolderSelector: false } })
+    const fu = await getAdminUser('flaguser')
+    eq(fu.allowFolderSelector, false, 'flags: POST /admin/users explicit allowFolderSelector=false honoured')
+    eq(fu.allowShuffle, true, 'flags: POST /admin/users absent allowShuffle → true')
+
+    // 4. a LEGACY user object (fields never written) still reports true.
+    // 'bob' was created before this block by a body carrying no flags; strip the keys
+    // off disk to simulate a pre-feature users.json, then make the server re-read it.
+    const usersPath = path.join(DATA, 'users.json')
+    const store = JSON.parse(fs.readFileSync(usersPath, 'utf8'))
+    const legacy = store.users.find(u => u.username === 'bob')
+    delete legacy.allowFolderSelector
+    delete legacy.allowShuffle
+    ok(!('allowFolderSelector' in legacy) && !('allowShuffle' in legacy), 'flags: legacy user has no flag keys on disk')
+    fs.writeFileSync(usersPath, JSON.stringify(store, null, 2))
+    // a fresh process loads that users.json exactly as a deployed upgrade would
+    const legacySrv = spawn(process.execPath, ['server.mjs'], {
+      cwd: ROOT,
+      env: { ...process.env, PORT: String(PORT2), HOST: '127.0.0.1', MUSIC_ROOT: MUSIC, DATA_DIR: DATA, ADMIN_USER: 'admin', ADMIN_PASS: 'admin' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    try {
+      const BASE2 = `http://127.0.0.1:${PORT2}`
+      let up2 = false
+      for (let i = 0; i < 100; i++) {
+        try { const r = await fetch(BASE2 + '/auth/me'); if (r.status === 401) { up2 = true; break } } catch { /* not up yet */ }
+        await new Promise(r => setTimeout(r, 100))
+      }
+      ok(up2, 'flags: second server (legacy users.json) starts')
+      // bob's own /auth/me — his password is known, so this is the real client path
+      const bobLogin = await (await fetch(BASE2 + '/auth/login', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'bob', password: 'bobpass12' }),
+      })).json()
+      eq(bobLogin.user.allowFolderSelector, true, 'flags: legacy user /auth/login → allowFolderSelector true')
+      eq(bobLogin.user.allowShuffle, true, 'flags: legacy user /auth/login → allowShuffle true')
+      const bobMe = await (await fetch(BASE2 + '/auth/me', { headers: { Authorization: `Bearer ${bobLogin.token}` } })).json()
+      eq(bobMe.user.allowFolderSelector, true, 'flags: legacy user /auth/me → allowFolderSelector true')
+      eq(bobMe.user.allowShuffle, true, 'flags: legacy user /auth/me → allowShuffle true')
+    } finally {
+      legacySrv.kill()
+    }
 
   } finally {
     srv.kill()

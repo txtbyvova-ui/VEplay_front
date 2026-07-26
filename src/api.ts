@@ -14,6 +14,10 @@ export interface User {
   name: string | null
   singlePlaylist?: boolean
   weakPassword?: boolean
+  // Per-client feature flags. Opt-out: the server normalises missing → true, so
+  // an undefined value here (an old cached user) should also be read as allowed.
+  allowFolderSelector?: boolean
+  allowShuffle?: boolean
 }
 
 export function authHeaders(token: string | null): Record<string, string> {
@@ -37,6 +41,8 @@ export interface ClientInfo {
   name: string
   username: string | null
   singlePlaylist: boolean
+  allowFolderSelector: boolean
+  allowShuffle: boolean
   counts: Record<string, number>
   sizeBytes: number
 }
@@ -59,9 +65,18 @@ export interface AdminTrack {
 }
 
 export interface UploadResult {
-  uploaded: { filename: string; category: Category }[]
-  rejected: { filename: string; reason: string }[]
+  accepted: { filename: string; category: string }[]
+  rejected: { filename: string; reason: string }[]   // reason ∈ size | ext | name | write_error
 }
+
+// Human-readable text for the server's upload-rejection reason codes.
+const UPLOAD_REJECT_TEXT: Record<string, string> = {
+  size: 'больше 200 МБ',
+  ext:  'неподдерживаемый формат',
+  name: 'недопустимое имя файла',
+  write_error: 'ошибка записи на диск',
+}
+export const uploadRejectText = (reason: string): string => UPLOAD_REJECT_TEXT[reason] ?? reason
 
 // ── classify staging (admin) ─────────────────────────────────────────────────
 
@@ -84,6 +99,8 @@ export interface Batch {
   status: 'classifying' | 'ready' | 'error' | 'confirming'
   tracks: StagedTrack[]
   error?: string
+  /** Set when the run finished but Gemini fell back — categories are not real classifications. */
+  warning?: string | null
   uploaded?: number
   skipped?: string[]
 }
@@ -122,7 +139,14 @@ export const deleteTrack = (token: string | null, folderId: string, category: st
     { method: 'DELETE' },
   )
 
-export const updateUser = (token: string | null, username: string, patch: { password?: string }) =>
+/** Fields `PUT /admin/users/:name` accepts. Omitted keys leave the stored value untouched. */
+export interface UserPatch {
+  password?: string
+  allowFolderSelector?: boolean
+  allowShuffle?: boolean
+}
+
+export const updateUser = (token: string | null, username: string, patch: UserPatch) =>
   request<User>(token, `/admin/users/${encodeURIComponent(username)}`, { method: 'PUT', body: JSON.stringify(patch) })
 
 /**

@@ -29,6 +29,14 @@ if (files.some(f => f.toUpperCase().includes('FAIL'))) {
   process.exit(1)
 }
 
+// A staged file named like "*SLOW*.mp3" keeps the stub running (holding the mp3s
+// open, like librosa does) so cancellation-while-classifying can be exercised.
+if (files.some(f => f.toUpperCase().includes('SLOW'))) {
+  const held = files.map(f => fs.openSync(`${folder}/${f}`, 'r'))
+  process.on('exit', () => { for (const fd of held) { try { fs.closeSync(fd) } catch { /* ignore */ } } })
+  await new Promise(r => setTimeout(r, 60_000))
+}
+
 // Derive a category from the filename so confirm() lands files deterministically.
 // Files with no keyword report "night" — the server must normalize that to evening.
 const catOf = (f) =>
@@ -51,4 +59,10 @@ const tracks = files.map(f => {
   }
 })
 
-process.stdout.write(JSON.stringify({ tracks }))
+// A staged file named like "*DEGRADED*.mp3" makes the stub report the top-level
+// `warning` that classify_stage.py emits when Gemini fell back to default values.
+const degraded = files.some(f => f.toUpperCase().includes('DEGRADED'))
+
+process.stdout.write(JSON.stringify(
+  degraded ? { tracks, warning: 'Gemini не ответил — категории запасные.' } : { tracks },
+))

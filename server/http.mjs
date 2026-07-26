@@ -5,6 +5,9 @@
 import { verifyToken } from './crypto.mjs'
 import { findUser } from './users.mjs'
 
+// How long an over-sized JSON body is drained so the response can be delivered.
+const BODY_DRAIN_MS = 5000
+
 /** @typedef {import('node:http').IncomingMessage} IncomingMessage */
 /** @typedef {import('node:http').ServerResponse} ServerResponse */
 
@@ -33,9 +36,29 @@ export function json(res, data, status = 200) {
 export function readBody(req) {
   return new Promise((resolve) => {
     let raw = ''
-    req.on('data', c => { raw += c; if (raw.length > 1e6) req.destroy() })
-    req.on('end', () => { try { resolve(raw ? JSON.parse(raw) : {}) } catch { resolve({}) } })
-    req.on('error', () => resolve({}))
+    let settled = false
+    // Every exit path must resolve exactly once. Destroying the socket on an
+    // oversized body without resolving used to leave the awaiting request handler
+    // suspended forever — one leaked async frame (and its closure) per such request.
+    /** @param {any} value */
+    const done = (value) => { if (!settled) { settled = true; resolve(value) } }
+    req.on('data', c => {
+      if (settled) return   // over the cap: drop the rest instead of growing `raw`
+      raw += c
+      if (raw.length > 1e6) {
+        done({})
+        // Keep draining rather than destroying the socket, so the handler's reply
+        // still reaches the client (a destroy here surfaces as ECONNRESET with no
+        // status). The deadline stops a huge body from holding the socket open.
+        req.resume()
+        const kill = setTimeout(() => { try { req.destroy() } catch { /* already gone */ } }, BODY_DRAIN_MS)
+        kill.unref?.()
+        req.once('end', () => clearTimeout(kill))
+      }
+    })
+    req.on('end',   () => { try { done(raw ? JSON.parse(raw) : {}) } catch { done({}) } })
+    req.on('error', () => done({}))
+    req.on('close', () => done({}))   // aborted mid-body: 'end' never fires
   })
 }
 

@@ -22,6 +22,8 @@ import { hashPassword } from './crypto.mjs'
  * @property {string|null=} name
  * @property {boolean=} singlePlaylist
  * @property {boolean=} weakPassword
+ * @property {boolean=} allowFolderSelector
+ * @property {boolean=} allowShuffle
  */
 
 /** @returns {User[] | null} */
@@ -87,14 +89,33 @@ export const setUsers = (arr) => { users = arr }
 
 /**
  * @param {User} u
- * @returns {{ username: string, role: string, categories: string[], folderId: string|null, name: string|null, singlePlaylist: boolean, weakPassword: boolean }}
+ * @returns {{ username: string, role: string, categories: string[], folderId: string|null, name: string|null, singlePlaylist: boolean, weakPassword: boolean, allowFolderSelector: boolean, allowShuffle: boolean }}
  */
 export const sanitize = (u) => ({
   username: u.username, role: u.role, categories: u.categories,
   folderId: u.folderId ?? null, name: u.name ?? null,
   singlePlaylist: u.singlePlaylist === true,
   weakPassword: u.weakPassword === true,
+  // Opt-OUT flags: absent/undefined means "allowed". Legacy users in users.json
+  // predate these fields and must keep their UI, so only an explicit `false` hides it.
+  allowFolderSelector: u.allowFolderSelector !== false,
+  allowShuffle: u.allowShuffle !== false,
 })
+
+/**
+ * Pick the per-client feature flags that are *explicitly* present as booleans in a
+ * request body. Absent keys are omitted entirely so callers can distinguish
+ * "not sent" (leave stored value alone) from "sent as false" (turn the flag off).
+ * @param {Record<string, unknown>} body
+ * @returns {{ allowFolderSelector?: boolean, allowShuffle?: boolean }}
+ */
+export const readFlags = (body) => {
+  /** @type {{ allowFolderSelector?: boolean, allowShuffle?: boolean }} */
+  const out = {}
+  if (typeof body?.allowFolderSelector === 'boolean') out.allowFolderSelector = body.allowFolderSelector
+  if (typeof body?.allowShuffle === 'boolean') out.allowShuffle = body.allowShuffle
+  return out
+}
 
 /**
  * @param {unknown} cats

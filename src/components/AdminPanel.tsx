@@ -33,7 +33,7 @@ export default function AdminPanel({ onBack }: { onBack: () => void }) {
   }
 
   return (
-    <div style={{ width: '100vw', height: '100vh', background: '#0a0a0a', color: '#fff', overflowY: 'auto' }}>
+    <div style={{ width: '100vw', height: '100dvh', background: '#0a0a0a', color: '#fff', overflowY: 'auto' }}>
       <div style={{ maxWidth: 820, margin: '0 auto', padding: '28px 24px 60px' }}>
         {/* header */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 24, gap: 10, flexWrap: 'wrap' }}>

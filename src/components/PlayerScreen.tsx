@@ -100,6 +100,14 @@ function DiscIcon({ size = 20, stroke = 'rgba(255,255,255,0.7)' }: { size?: numb
     </svg>
   )
 }
+function ShuffleIcon({ size = 22, stroke = 'rgba(255,255,255,0.7)' }: { size?: number; stroke?: string }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={stroke} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M16 3h5v5" /><path d="M4 20 21 3" />
+      <path d="M21 16v5h-5" /><path d="m15 15 6 6" /><path d="M4 4l5 5" />
+    </svg>
+  )
+}
 const CAT_ICONS = { morning: MoonIcon, day: SunIcon, evening: SunsetIcon, all: DiscIcon }
 function CatIcon({ cat, size, stroke }: { cat: string; size?: number; stroke?: string }) {
   const Icon = (CAT_ICONS as Record<string, typeof MoonIcon>)[cat] ?? SunIcon
@@ -236,12 +244,15 @@ export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void
   const { user, logout } = useAuth()
   const allowed = (user?.categories ?? []) as string[]
   const singlePlaylist = user?.singlePlaylist === true
+  // Per-venue feature flags. Opt-out: undefined (old cached user) means allowed.
+  const canFolders = user?.allowFolderSelector !== false
+  const canShuffle = user?.allowShuffle !== false
 
   const {
     tracks, currentTrack, currentIndex,
     isPlaying, currentTime, duration,
     loading, togglePlay, next, seek, replaceQueueAndPlay,
-    volume, setVolume,
+    volume, setVolume, shuffle, toggleShuffle,
   } = usePlayer()
 
   const { library, loading: libLoading } = useLibrary()
@@ -315,7 +326,7 @@ export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void
     <div
       className="player-root"
       style={{
-        display: 'flex', width: '100vw', height: '100vh',
+        display: 'flex', width: '100vw', height: '100dvh',
         background: '#0a0a0a', overflow: 'hidden', position: 'relative',
       }}
     >
@@ -349,7 +360,9 @@ export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void
       {/* ── RIGHT: Controls (55%) ── */}
       <div className="player-right" style={{
         flex: 1, display: 'flex', flexDirection: 'column',
-        justifyContent: 'space-between', padding: '28px 36px 28px 32px',
+        justifyContent: 'space-between',
+        // env() resolves to 0 on desktop; on iPhone it lifts the controls off the home-indicator
+        padding: '28px 36px calc(28px + env(safe-area-inset-bottom)) 32px',
         overflow: 'hidden',
       }}>
 
@@ -459,6 +472,24 @@ export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void
             >
               <SkipForward weight="fill" size={40} color="rgba(255,255,255,0.72)" />
             </button>
+
+            {/* Shuffle — hidden when the venue's allowShuffle flag is off */}
+            {canShuffle && (
+              <button
+                className="player-btn-shuffle"
+                aria-label="Случайный порядок"
+                aria-pressed={shuffle}
+                style={{
+                  ...btnBase, width: 64, height: 64,
+                  background: shuffle ? 'rgba(255,255,255,0.16)' : 'rgba(255,255,255,0.07)',
+                  outline: shuffle ? '1.5px solid rgba(255,255,255,0.45)' : 'none',
+                }}
+                onClick={toggleShuffle}
+                onTouchStart={press} onTouchEnd={release}
+              >
+                <ShuffleIcon size={26} stroke={shuffle ? '#ffffff' : 'rgba(255,255,255,0.55)'} />
+              </button>
+            )}
           </div>
 
           {/* Next track hint */}
@@ -472,7 +503,7 @@ export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void
         </div>
 
         {/* Playlist switcher — only categories this user may access (hidden in single-playlist mode) */}
-        {!singlePlaylist && allowed.length > 1 && (
+        {!singlePlaylist && allowed.length > 1 && canFolders && (
           <CategoryBar allowed={allowed} activeCat={activeCat} onSwitch={switchCategory} />
         )}
 
