@@ -144,7 +144,12 @@ export function usePlayer() {
     applyGain('B', 0)
 
     // iOS starts the context suspended and only resumes inside a gesture.
-    const kick = () => { void graph.resume() }
+    // Also kick off the one-time <audio> element blessing (warmUp, defined
+    // below) right here: it needs a real play()/pause() cycle on both
+    // elements, and starting that on the FIRST touch (pointerdown fires well
+    // before the click that drives togglePlay) gives it a head start so it's
+    // finished — not racing — by the time the real play() call happens.
+    const kick = () => { void graph.resume(); void warmUpRef.current?.() }
     window.addEventListener('pointerdown', kick, { once: true })
     window.addEventListener('keydown', kick, { once: true })
 
@@ -269,20 +274,29 @@ export function usePlayer() {
   // `warming` suppresses the play/pause events this priming emits so the UI
   // never flickers; it is awaited fully so the real play() that follows can
   // never race the priming pause().
-  const hasInteracted = useRef(false)
-  const warming       = useRef(false)
-  const warmUp = useCallback(async () => {
-    if (hasInteracted.current) return
+  const hasInteracted  = useRef(false)
+  const warming        = useRef(false)
+  // Concurrent callers (e.g. the early pointerdown kick AND a fast togglePlay
+  // tap) must all await the SAME run — otherwise the second caller saw
+  // hasInteracted already true and returned immediately, before the first
+  // call's priming pause() had actually happened, letting it land AFTER the
+  // real play() and silently re-pause the element. Caching the promise fixes
+  // that race.
+  const warmUpPromise = useRef<Promise<void> | null>(null)
+  const warmUp = useCallback((): Promise<void> => {
+    if (warmUpPromise.current) return warmUpPromise.current
     hasInteracted.current = true
     warming.current = true
-    await Promise.all([elA.current, elB.current].map(async el => {
+    warmUpPromise.current = Promise.all([elA.current, elB.current].map(async el => {
       if (!el) return
       // No src / autoplay-blocked → play() rejects, but the element is still
       // blessed for the rest of the session, which is all we need.
       try { await el.play(); el.pause() } catch { /* ignore */ }
-    }))
-    warming.current = false
+    })).then(() => { warming.current = false })
+    return warmUpPromise.current
   }, [])
+  const warmUpRef = useRef(warmUp)
+  useEffect(() => { warmUpRef.current = warmUp }, [warmUp])
 
   // ── switching ─────────────────────────────────────────────────────────────
   /** Start `pos` on the idle side and cross-fade to it over `seconds`. */
