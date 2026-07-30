@@ -25,6 +25,19 @@ const SWITCH_SEC = 0.25
 const PRELOAD_AHEAD = 3
 /** Throttle for writing the resume-point to localStorage. */
 const SAVE_EVERY_MS = 5000
+/** Hard deadline for the one-time element priming (see warmUp). */
+const WARMUP_TIMEOUT_MS = 600
+/**
+ * 0.05 s of 8-bit silence, as a data: URI.
+ *
+ * An <audio> with NO source cannot be primed at all: Chromium leaves such a
+ * play() PENDING FOREVER (no resolve, no reject — networkState stays
+ * NETWORK_EMPTY) and Safari rejects it. warmUp() is AWAITED by togglePlay, so
+ * that pending promise wedged the Play button on every Chromium build. Giving
+ * the idle element something — anything — to load makes the priming play()
+ * actually settle, on every engine.
+ */
+const SILENT_WAV = 'data:audio/wav;base64,UklGRrQBAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YZABAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA'
 
 type Side = 'A' | 'B'
 
@@ -274,27 +287,51 @@ export function usePlayer() {
   // `warming` suppresses the play/pause events this priming emits so the UI
   // never flickers; it is awaited fully so the real play() that follows can
   // never race the priming pause().
-  const hasInteracted  = useRef(false)
-  const warming        = useRef(false)
+  const warming = useRef(false)
   // Concurrent callers (e.g. the early pointerdown kick AND a fast togglePlay
-  // tap) must all await the SAME run — otherwise the second caller saw
-  // hasInteracted already true and returned immediately, before the first
-  // call's priming pause() had actually happened, letting it land AFTER the
-  // real play() and silently re-pause the element. Caching the promise fixes
-  // that race.
+  // tap) must all await the SAME run — otherwise the second caller saw the
+  // "already primed" flag and returned immediately, before the first call's
+  // priming pause() had actually happened, letting it land AFTER the real
+  // play() and silently re-pause the element. Caching the promise fixes that.
   const warmUpPromise = useRef<Promise<void> | null>(null)
+
+  /** Prime ONE element: a real play()/pause() pair inside the user gesture. */
+  const primeElement = useCallback(async (el: HTMLAudioElement | null): Promise<void> => {
+    if (!el) return
+    // An element with nothing loaded cannot be primed at all (see SILENT_WAV) —
+    // lend it the silence. Never clobber a side that already holds a real track.
+    const borrowed = !el.getAttribute('src')
+    if (borrowed) {
+      // Safari refuses a same-origin (data:/blob:) source on a CORS-tagged
+      // element; loadInto() sets crossOrigin again for every real track anyway.
+      el.crossOrigin = null
+      el.src = SILENT_WAV
+    }
+    try {
+      await el.play()
+      // If the deadline in warmUp() already fired, the REAL play() may have
+      // started meanwhile — pausing here would be exactly the bug 05c3508 fixed.
+      if (warming.current) el.pause()
+    } catch { /* autoplay refused — the element is blessed for the session anyway */ }
+    // Back to "empty" so togglePlay's `if (!el.src)` still loads the real track.
+    // Skipped when something already replaced our placeholder.
+    if (borrowed && el.getAttribute('src') === SILENT_WAV) {
+      el.removeAttribute('src')
+      el.load()
+    }
+  }, [])
+
   const warmUp = useCallback((): Promise<void> => {
     if (warmUpPromise.current) return warmUpPromise.current
-    hasInteracted.current = true
     warming.current = true
-    warmUpPromise.current = Promise.all([elA.current, elB.current].map(async el => {
-      if (!el) return
-      // No src / autoplay-blocked → play() rejects, but the element is still
-      // blessed for the rest of the session, which is all we need.
-      try { await el.play(); el.pause() } catch { /* ignore */ }
-    })).then(() => { warming.current = false })
+    const primed = Promise.all([elA.current, elB.current].map(el => primeElement(el))).then(() => {})
+    // Hard deadline. togglePlay and switchTo AWAIT this promise, so it must settle
+    // whatever an engine does with a play() we do not control — a pending one used
+    // to leave the Play button permanently dead.
+    const deadline = new Promise<void>(resolve => { window.setTimeout(resolve, WARMUP_TIMEOUT_MS) })
+    warmUpPromise.current = Promise.race([primed, deadline]).then(() => { warming.current = false })
     return warmUpPromise.current
-  }, [])
+  }, [primeElement])
   const warmUpRef = useRef(warmUp)
   useEffect(() => { warmUpRef.current = warmUp }, [warmUp])
 
@@ -332,8 +369,14 @@ export function usePlayer() {
       setDuration(isFinite(elTo.duration) ? elTo.duration : 0)
 
       const elFrom = elFor(from)
-      window.setTimeout(() => { try { elFrom?.pause(); if (elFrom) elFrom.currentTime = 0 } catch { /* ignore */ } },
-        Math.ceil(seconds * 1000) + 60)
+      window.setTimeout(() => {
+        // A newer switch may have made THIS side active again — a manual next inside
+        // the 6 s auto-crossfade window does exactly that (A→B, then B→A). Firing a
+        // stale pause() then kills live playback and leaves the venue silent until
+        // someone taps Play. Only ever pause a side that is no longer active.
+        if (elFor(active.current) === elFrom) return
+        try { elFrom?.pause(); if (elFrom) elFrom.currentTime = 0 } catch { /* ignore */ }
+      }, Math.ceil(seconds * 1000) + 60)
 
       preloadAhead(nextPos)
     } finally {
