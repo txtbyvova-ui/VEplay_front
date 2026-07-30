@@ -261,8 +261,20 @@ export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void
   const [cover, setCover]             = useState(randCover())
   const [coverOpacity, setCoverOpacity] = useState(1)
 
+  // Drag state of the two custom sliders. While a finger is down the bar shows the
+  // LOCAL ratio, not the audio's — otherwise the ~4×/sec timeupdate ticks would
+  // yank the handle back out from under the finger. null = not dragging.
+  const [scrub, setScrub]     = useState<number | null>(null)
+  const [volDrag, setVolDrag] = useState<number | null>(null)
+  // Refs mirror the drag flags: a pointermove can arrive in the same frame as the
+  // pointerdown, before the state re-render, and would otherwise be dropped.
+  const scrubbing    = useRef(false)
+  const volDragging  = useRef(false)
+
   const swipeX    = useRef<number | null>(null)
   const progress  = duration > 0 ? currentTime / duration : 0
+  const shownProgress = scrub ?? progress
+  const shownVolume   = volDrag ?? volume
   const nextTrack = tracks.length > 0
     ? tracks[(currentIndex + 1) % tracks.length]
     : null
@@ -290,27 +302,61 @@ export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void
     if (list.length > 0) replaceQueueAndPlay(list, 0)
   }, [library, libLoading, activeCat, replaceQueueAndPlay])
 
-  // Progress bar seek — touch
-  function onProgressTouch(e: React.TouchEvent<HTMLDivElement>) {
-    const r = e.currentTarget.getBoundingClientRect()
-    seek(Math.max(0, Math.min(1, (e.touches[0].clientX - r.left) / r.width)))
+  // Both sliders run on Pointer Events, so one code path covers touch, mouse and
+  // pen — and setPointerCapture keeps the events coming to the bar even when the
+  // finger slides off it. A plain tap is just a down+up at the same spot, so the
+  // old click-to-seek behaviour still works.
+  const ratioAt = (el: HTMLElement, clientX: number): number => {
+    const r = el.getBoundingClientRect()
+    if (r.width <= 0) return 0
+    return Math.max(0, Math.min(1, (clientX - r.left) / r.width))
   }
-  // Progress bar seek — mouse
-  function onProgressClick(e: React.MouseEvent<HTMLDivElement>) {
-    const r = e.currentTarget.getBoundingClientRect()
-    seek(Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)))
+  const capture = (e: React.PointerEvent<HTMLDivElement>) => {
+    try { e.currentTarget.setPointerCapture(e.pointerId) } catch { /* pointer already gone */ }
   }
 
-  // Volume seek — touch
-  function onVolumeTouch(e: React.TouchEvent<HTMLDivElement>) {
-    const r = e.currentTarget.getBoundingClientRect()
-    setVolume(Math.max(0, Math.min(1, (e.touches[0].clientX - r.left) / r.width)))
+  // Timeline: the real currentTime is set only on release — seeking on every pixel
+  // makes the element re-buffer and stutter under the finger.
+  const onProgressDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    capture(e)
+    scrubbing.current = true
+    setScrub(ratioAt(e.currentTarget, e.clientX))
   }
-  // Volume seek — mouse
-  function onVolumeClick(e: React.MouseEvent<HTMLDivElement>) {
-    const r = e.currentTarget.getBoundingClientRect()
-    setVolume(Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)))
+  const onProgressMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!scrubbing.current) return
+    setScrub(ratioAt(e.currentTarget, e.clientX))
   }
+  const onProgressUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!scrubbing.current) return
+    scrubbing.current = false
+    const ratio = ratioAt(e.currentTarget, e.clientX)
+    setScrub(null)
+    seek(ratio)
+  }
+  const onProgressCancel = () => { scrubbing.current = false; setScrub(null) }
+
+  // Volume is applied live while dragging: the master gain ramps over 15 ms, so
+  // it costs nothing and the venue hears the change as it moves.
+  const onVolumeDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    capture(e)
+    volDragging.current = true
+    const ratio = ratioAt(e.currentTarget, e.clientX)
+    setVolDrag(ratio)
+    setVolume(ratio)
+  }
+  const onVolumeMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!volDragging.current) return
+    const ratio = ratioAt(e.currentTarget, e.clientX)
+    setVolDrag(ratio)
+    setVolume(ratio)
+  }
+  const onVolumeUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!volDragging.current) return
+    volDragging.current = false
+    setVolume(ratioAt(e.currentTarget, e.clientX))
+    setVolDrag(null)
+  }
+  const onVolumeCancel = () => { volDragging.current = false; setVolDrag(null) }
 
   // Swipe handlers on cover — stable so the memoized Vinyl doesn't re-render each tick.
   const onSwipeStart = useCallback((e: React.TouchEvent) => { swipeX.current = e.touches[0].clientX }, [])
@@ -332,8 +378,14 @@ export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void
     >
       <NoiseOverlay />
 
-      {/* Top-right: session controls */}
-      <div style={{ position: 'absolute', top: 14, right: 16, zIndex: 10000, display: 'flex', gap: 8 }}>
+      {/* Top-right: session controls. env() keeps them off the notch / Dynamic
+          Island in portrait and off the rounded corner in landscape (0 on desktop). */}
+      <div style={{
+        position: 'absolute',
+        top:   'calc(14px + env(safe-area-inset-top))',
+        right: 'calc(16px + env(safe-area-inset-right))',
+        zIndex: 10000, display: 'flex', gap: 8,
+      }}>
         {onOpenAdmin && <button style={topBtn} onClick={onOpenAdmin}>Админка</button>}
         <button style={topBtn} onClick={logout}>Выйти</button>
       </div>
@@ -345,6 +397,9 @@ export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void
           width: '45%', flexShrink: 0, position: 'relative',
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           overflow: 'hidden',
+          // Landscape is the iPad default layout — the left edge is where the
+          // notch / rounded corner lives there.
+          paddingLeft: 'env(safe-area-inset-left)',
           background: 'linear-gradient(135deg, #0f0f0f 0%, #1c1c1c 50%, #0d0d0d 100%)',
         }}
       >
@@ -361,9 +416,15 @@ export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void
       <div className="player-right" style={{
         flex: 1, display: 'flex', flexDirection: 'column',
         justifyContent: 'space-between',
-        // env() resolves to 0 on desktop; on iPhone it lifts the controls off the home-indicator
-        padding: '28px 36px calc(28px + env(safe-area-inset-bottom)) 32px',
-        overflow: 'hidden',
+        // env() resolves to 0 on desktop; on iPhone/iPad it lifts the controls off
+        // the home-indicator and away from the landscape right-edge cutout.
+        padding: '28px calc(36px + env(safe-area-inset-right)) calc(28px + env(safe-area-inset-bottom)) 32px',
+        // A short screen used to clip the bottom of this column (space-between +
+        // overflow:hidden). Let it scroll vertically instead of swallowing controls;
+        // pan-y is required because html/body set touch-action: none.
+        overflowX: 'hidden',
+        overflowY: 'auto',
+        touchAction: 'pan-y',
       }}>
 
         {/* Track info */}
@@ -390,26 +451,30 @@ export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void
         </div>
 
         {/* Progress bar */}
-        <div>
-          {/* 48px touch target */}
+        <div style={{ paddingInline: 8 }}>
+          {/* 48px touch target. touchAction 'none' — without it the browser claims
+              the gesture as a page pan and the bar can only be tapped, not dragged. */}
           <div
-            style={{ height: 48, display: 'flex', alignItems: 'center', cursor: 'pointer' }}
-            onTouchStart={onProgressTouch}
-            onClick={onProgressClick}
+            style={{ height: 48, display: 'flex', alignItems: 'center', cursor: 'pointer', touchAction: 'none' }}
+            onPointerDown={onProgressDown}
+            onPointerMove={onProgressMove}
+            onPointerUp={onProgressUp}
+            onPointerCancel={onProgressCancel}
           >
             <div style={{
               width: '100%', height: 8,
               background: 'rgba(255,255,255,0.1)', borderRadius: 4, position: 'relative',
             }}>
               <div style={{
-                height: '100%', width: `${progress * 100}%`,
+                height: '100%', width: `${shownProgress * 100}%`,
                 background: '#ffffff', borderRadius: 4,
-                transition: 'width 0.2s linear',
+                // No easing while dragging: the fill must sit exactly under the finger.
+                transition: scrub === null ? 'width 0.2s linear' : 'none',
               }} />
               <div style={{
                 position: 'absolute', top: '50%', transform: 'translate(-50%, -50%)',
-                left: `${progress * 100}%`,
-                width: 18, height: 18, borderRadius: '50%',
+                left: `${shownProgress * 100}%`,
+                width: scrub === null ? 18 : 22, height: scrub === null ? 18 : 22, borderRadius: '50%',
                 background: '#ffffff', boxShadow: '0 2px 8px rgba(0,0,0,0.4)',
                 pointerEvents: 'none',
               }} />
@@ -417,7 +482,7 @@ export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void
           </div>
           <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 2 }}>
             <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.32)', fontVariantNumeric: 'tabular-nums', fontFamily: 'monospace' }}>
-              {fmt(currentTime)}
+              {fmt(scrub !== null && duration > 0 ? scrub * duration : currentTime)}
             </span>
             <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.32)', fontVariantNumeric: 'tabular-nums', fontFamily: 'monospace' }}>
               {fmt(duration)}
@@ -426,20 +491,27 @@ export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void
         </div>
 
         {/* Volume */}
-        <div className="player-volume-row" style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <div className="player-volume-row" style={{ display: 'flex', alignItems: 'center', gap: 10, paddingInline: 8 }}>
           <SpeakerIcon size={18} stroke="rgba(255,255,255,0.4)" />
           <div
             className="player-volume-wrap"
-            style={{ width: 200, height: 48, display: 'flex', alignItems: 'center', cursor: 'pointer', touchAction: 'manipulation' }}
-            onTouchStart={onVolumeTouch}
-            onClick={onVolumeClick}
+            // 'none', not 'manipulation': 'manipulation' still lets the browser pan
+            // the page, which is what made this slider tap-only.
+            style={{ width: 200, height: 48, display: 'flex', alignItems: 'center', cursor: 'pointer', touchAction: 'none' }}
+            onPointerDown={onVolumeDown}
+            onPointerMove={onVolumeMove}
+            onPointerUp={onVolumeUp}
+            onPointerCancel={onVolumeCancel}
           >
             <div style={{ width: '100%', height: 6, background: 'rgba(255,255,255,0.1)', borderRadius: 3, position: 'relative' }}>
-              <div style={{ height: '100%', width: `${volume * 100}%`, background: 'rgba(255,255,255,0.65)', borderRadius: 3, transition: 'width 50ms linear' }} />
+              <div style={{
+                height: '100%', width: `${shownVolume * 100}%`, background: 'rgba(255,255,255,0.65)', borderRadius: 3,
+                transition: volDrag === null ? 'width 50ms linear' : 'none',
+              }} />
               <div style={{
                 position: 'absolute', top: '50%', transform: 'translate(-50%, -50%)',
-                left: `${volume * 100}%`,
-                width: 14, height: 14, borderRadius: '50%',
+                left: `${shownVolume * 100}%`,
+                width: volDrag === null ? 14 : 18, height: volDrag === null ? 14 : 18, borderRadius: '50%',
                 background: '#fff', pointerEvents: 'none',
                 boxShadow: '0 1px 6px rgba(0,0,0,0.4)',
               }} />
