@@ -117,27 +117,58 @@ export async function putCached(url: string, buf: ArrayBuffer): Promise<void> {
 /**
  * Fetch a track and cache it. Returns true when the bytes ended up in the cache.
  * Never throws — a failed preload must never disturb playback.
+ *
+ * `signal` aborts BOTH the request and the body download: `r.arrayBuffer()` pulls
+ * the whole track into memory, and that is the expensive half.
  */
-export async function fetchAndCache(url: string): Promise<boolean> {
+export async function fetchAndCache(url: string, signal?: AbortSignal): Promise<boolean> {
   try {
+    if (signal?.aborted) return false
     if (await isCached(url)) return true
-    const r = await fetch(url)
+    const r = await fetch(url, { signal })
     if (!r.ok) return false
     const buf = await r.arrayBuffer()
+    // Aborted while the body was streaming in: drop the bytes instead of paying
+    // for an IndexedDB write (and an evictLRU pass) nobody is waiting for.
+    if (signal?.aborted) return false
     await putCached(url, buf)
     return true
   } catch {
-    return false
+    return false   // AbortError lands here too — a cancelled preload is not an error
   }
+}
+
+/** In-flight preload run, so a newer one can cancel it. */
+let preloadAbort: AbortController | null = null
+
+/**
+ * Abort whatever the preloader is currently downloading.
+ *
+ * Skipping a track makes every byte still in flight useless: without this, a
+ * burst of Next taps left one full-file download per tap racing the track the
+ * user actually wants, each holding an ArrayBuffer of the whole file.
+ */
+export function cancelPreload(): void {
+  preloadAbort?.abort()
+  preloadAbort = null
 }
 
 /**
  * Background preloader: pull the next few tracks into the cache, one at a time so
  * we never compete with the currently-playing stream for bandwidth.
+ *
+ * Starting a new run cancels the previous one — only the newest queue matters.
  */
 export async function preload(urls: string[]): Promise<void> {
+  cancelPreload()
+  const ac = new AbortController()
+  preloadAbort = ac
   // Deliberately sequential: a preload must never compete with the playing stream.
-  for (const url of urls) await fetchAndCache(url)
+  for (const url of urls) {
+    if (ac.signal.aborted) return
+    await fetchAndCache(url, ac.signal)
+  }
+  if (preloadAbort === ac) preloadAbort = null
 }
 
 /**
