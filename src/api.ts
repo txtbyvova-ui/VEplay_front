@@ -18,6 +18,8 @@ export interface User {
   // an undefined value here (an old cached user) should also be read as allowed.
   allowFolderSelector?: boolean
   allowShuffle?: boolean
+  /** Opt-IN, unlike the two above: the in-player track list is off unless enabled. */
+  allowTrackList?: boolean
 }
 
 export function authHeaders(token: string | null): Record<string, string> {
@@ -43,6 +45,7 @@ export interface ClientInfo {
   singlePlaylist: boolean
   allowFolderSelector: boolean
   allowShuffle: boolean
+  allowTrackList: boolean
   counts: Record<string, number>
   sizeBytes: number
 }
@@ -144,6 +147,7 @@ export interface UserPatch {
   password?: string
   allowFolderSelector?: boolean
   allowShuffle?: boolean
+  allowTrackList?: boolean
 }
 
 export const updateUser = (token: string | null, username: string, patch: UserPatch) =>

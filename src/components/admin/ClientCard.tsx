@@ -249,6 +249,13 @@ export default function ClientCard({ client, allClients, token, onChanged, onCre
           >
             {client.allowShuffle ? '✓' : '✕'} Шафл
           </span>
+          {/* Список треков — клиент видит свою папку и может перейти на любой трек. */}
+          <span
+            style={{ ...chip(client.allowTrackList), opacity: flagBusy ? 0.5 : 1 }}
+            onClick={() => toggleFlag({ allowTrackList: !client.allowTrackList })}
+          >
+            {client.allowTrackList ? '✓' : '✕'} Список треков
+          </span>
         </div>
       )}
 
