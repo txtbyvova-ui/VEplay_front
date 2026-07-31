@@ -24,6 +24,7 @@ import { hashPassword } from './crypto.mjs'
  * @property {boolean=} weakPassword
  * @property {boolean=} allowFolderSelector
  * @property {boolean=} allowShuffle
+ * @property {boolean=} allowTrackList
  */
 
 /** @returns {User[] | null} */
@@ -89,7 +90,7 @@ export const setUsers = (arr) => { users = arr }
 
 /**
  * @param {User} u
- * @returns {{ username: string, role: string, categories: string[], folderId: string|null, name: string|null, singlePlaylist: boolean, weakPassword: boolean, allowFolderSelector: boolean, allowShuffle: boolean }}
+ * @returns {{ username: string, role: string, categories: string[], folderId: string|null, name: string|null, singlePlaylist: boolean, weakPassword: boolean, allowFolderSelector: boolean, allowShuffle: boolean, allowTrackList: boolean }}
  */
 export const sanitize = (u) => ({
   username: u.username, role: u.role, categories: u.categories,
@@ -100,6 +101,9 @@ export const sanitize = (u) => ({
   // predate these fields and must keep their UI, so only an explicit `false` hides it.
   allowFolderSelector: u.allowFolderSelector !== false,
   allowShuffle: u.allowShuffle !== false,
+  // Opt-IN, unlike the two above: the track list is a NEW screen, and turning it on
+  // for every existing venue at once would change their player without anyone asking.
+  allowTrackList: u.allowTrackList === true,
 })
 
 /**
@@ -107,13 +111,14 @@ export const sanitize = (u) => ({
  * request body. Absent keys are omitted entirely so callers can distinguish
  * "not sent" (leave stored value alone) from "sent as false" (turn the flag off).
  * @param {Record<string, unknown>} body
- * @returns {{ allowFolderSelector?: boolean, allowShuffle?: boolean }}
+ * @returns {{ allowFolderSelector?: boolean, allowShuffle?: boolean, allowTrackList?: boolean }}
  */
 export const readFlags = (body) => {
-  /** @type {{ allowFolderSelector?: boolean, allowShuffle?: boolean }} */
+  /** @type {{ allowFolderSelector?: boolean, allowShuffle?: boolean, allowTrackList?: boolean }} */
   const out = {}
   if (typeof body?.allowFolderSelector === 'boolean') out.allowFolderSelector = body.allowFolderSelector
   if (typeof body?.allowShuffle === 'boolean') out.allowShuffle = body.allowShuffle
+  if (typeof body?.allowTrackList === 'boolean') out.allowTrackList = body.allowTrackList
   return out
 }
 

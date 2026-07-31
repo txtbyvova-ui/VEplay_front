@@ -23,7 +23,19 @@ let ctx: AudioContext | null = null
 let compressor: DynamicsCompressorNode | null = null
 let master: GainNode | null = null
 
-/** MediaElementSource may be created only ONCE per element — remember them. */
+/**
+ * MediaElementSource may be created only ONCE per element — remember them.
+ *
+ * DO NOT tear this graph down on a track change. The whole graph is a FIXED set —
+ * one AudioContext, two MediaElementSource, two GainNode, a compressor and the
+ * master — built once for the two <audio> elements and never grown, so skipping
+ * tracks accumulates nothing to clean up. Calling disconnect()/close() per skip
+ * would free nothing and would be unrecoverable: createMediaElementSource() on an
+ * element that already has one throws InvalidStateError, so the next attach()
+ * would kill audio for the rest of the session. What actually leaks during a
+ * burst of skips is network and buffers, and that is handled in cache.ts
+ * (AbortController) and usePlayer (the retired element's src is released).
+ */
 const sources = new WeakMap<HTMLAudioElement, { source: MediaElementAudioSourceNode; gain: GainNode }>()
 
 function ensureCtx(): AudioContext {

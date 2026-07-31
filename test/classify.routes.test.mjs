@@ -319,7 +319,7 @@ async function main() {
     const streamAll = await fetch(`${BASE}/music/${spFolder}/all/${encodeURIComponent('X - track.mp3')}?token=${encodeURIComponent(token)}`, { headers: { Range: 'bytes=0-' } })
     ok(streamAll.status === 200 || streamAll.status === 206, `admin streams single-playlist 'all' track (status ${streamAll.status})`)
 
-    // ── feature flags: allowFolderSelector / allowShuffle ─────────────────────
+    // ── feature flags: allowFolderSelector / allowShuffle / allowTrackList ─────
     // Helper: read one user back out of GET /admin/users (a client's own /auth/me
     // is unreachable — its generated password is only returned once, at create).
     const getAdminUser = async (name) =>
@@ -330,14 +330,29 @@ async function main() {
     eq(ff.status, 201, 'flags: create client → 201')
     eq(ff.data.allowFolderSelector, true, 'flags: POST /admin/clients 201 body → allowFolderSelector true')
     eq(ff.data.allowShuffle, true, 'flags: POST /admin/clients 201 body → allowShuffle true')
+    // allowTrackList is opt-IN: a new screen must not turn itself on for anyone
+    eq(ff.data.allowTrackList, false, 'flags: POST /admin/clients 201 body → allowTrackList false (opt-in)')
     const ffUser = ff.data.username
     const ffRead = await getAdminUser(ffUser)
     eq(ffRead.allowFolderSelector, true, 'flags: GET /admin/users → allowFolderSelector true by default')
     eq(ffRead.allowShuffle, true, 'flags: GET /admin/users → allowShuffle true by default')
+    eq(ffRead.allowTrackList, false, 'flags: GET /admin/users → allowTrackList false by default')
     // the client list the admin UI renders from carries them too
     const ffList = (await api('GET', '/admin/clients', { token })).data.find(c => c.folderId === ff.data.folderId)
     eq(ffList.allowFolderSelector, true, 'flags: GET /admin/clients → allowFolderSelector true by default')
     eq(ffList.allowShuffle, true, 'flags: GET /admin/clients → allowShuffle true by default')
+    eq(ffList.allowTrackList, false, 'flags: GET /admin/clients → allowTrackList false by default')
+
+    // 1b. the admin can switch the track list ON, and it survives a round-trip
+    const tlOn = await api('PUT', `/admin/users/${encodeURIComponent(ff.data.username)}`, { token, body: { allowTrackList: true } })
+    eq(tlOn.status, 200, 'flags: PUT allowTrackList=true → 200')
+    eq(tlOn.data.allowTrackList, true, 'flags: PUT response → allowTrackList true')
+    eq((await getAdminUser(ff.data.username)).allowTrackList, true, 'flags: allowTrackList true persisted')
+    const tlList = (await api('GET', '/admin/clients', { token })).data.find(c => c.folderId === ff.data.folderId)
+    eq(tlList.allowTrackList, true, 'flags: GET /admin/clients → allowTrackList true after enabling')
+    // …and back OFF again
+    await api('PUT', `/admin/users/${encodeURIComponent(ff.data.username)}`, { token, body: { allowTrackList: false } })
+    eq((await getAdminUser(ff.data.username)).allowTrackList, false, 'flags: allowTrackList can be switched back off')
 
     // 2. PUT one flag false → persists; the untouched flag stays true
     const ffPut = await api('PUT', `/admin/users/${encodeURIComponent(ffUser)}`, { token, body: { allowShuffle: false } })
@@ -357,6 +372,7 @@ async function main() {
     const ffPw = await getAdminUser(ffUser)
     eq(ffPw.allowShuffle, false, 'flags: unrelated PUT leaves allowShuffle false')
     eq(ffPw.allowFolderSelector, true, 'flags: unrelated PUT leaves allowFolderSelector true')
+    eq(ffPw.allowTrackList, false, 'flags: unrelated PUT leaves allowTrackList false')
 
     // a non-boolean value is ignored (not coerced) — the stored value stands
     await api('PUT', `/admin/users/${encodeURIComponent(ffUser)}`, { token, body: { allowShuffle: 'yes' } })
@@ -367,6 +383,7 @@ async function main() {
     const fu = await getAdminUser('flaguser')
     eq(fu.allowFolderSelector, false, 'flags: POST /admin/users explicit allowFolderSelector=false honoured')
     eq(fu.allowShuffle, true, 'flags: POST /admin/users absent allowShuffle → true')
+    eq(fu.allowTrackList, false, 'flags: POST /admin/users absent allowTrackList → false (opt-in)')
 
     // 4. a LEGACY user object (fields never written) still reports true.
     // 'bob' was created before this block by a body carrying no flags; strip the keys
@@ -402,6 +419,8 @@ async function main() {
       const bobMe = await (await fetch(BASE2 + '/auth/me', { headers: { Authorization: `Bearer ${bobLogin.token}` } })).json()
       eq(bobMe.user.allowFolderSelector, true, 'flags: legacy user /auth/me → allowFolderSelector true')
       eq(bobMe.user.allowShuffle, true, 'flags: legacy user /auth/me → allowShuffle true')
+      eq(bobLogin.user.allowTrackList, false, 'flags: legacy user /auth/login → allowTrackList false')
+      eq(bobMe.user.allowTrackList, false, 'flags: legacy user /auth/me → allowTrackList false')
     } finally {
       legacySrv.kill()
     }

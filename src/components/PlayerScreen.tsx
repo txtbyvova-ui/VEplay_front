@@ -240,6 +240,92 @@ const CategoryBar = memo(function CategoryBar({ allowed, activeCat, onSwitch }: 
   )
 })
 
+// ── Track list — the venue's own folder, browsable. Memoized so the ~4×/sec
+// currentTime ticks never re-render the whole list; only the playing row changes. ──
+interface TrackListProps {
+  tracks: { id: string | number; title: string; artist: string }[]
+  currentIndex: number
+  isPlaying: boolean
+  title: string
+  onPick: (index: number) => void
+  onClose: () => void
+}
+const TrackList = memo(function TrackList({ tracks, currentIndex, isPlaying, title, onPick, onClose }: TrackListProps) {
+  return (
+    <div
+      style={{ position: 'fixed', inset: 0, zIndex: 10001, display: 'flex', justifyContent: 'flex-end', background: 'rgba(0,0,0,0.55)' }}
+      onClick={onClose}
+    >
+      <div
+        onClick={e => e.stopPropagation()}
+        style={{
+          width: 'min(440px, 100%)', height: '100%', background: '#111', display: 'flex', flexDirection: 'column',
+          borderLeft: '1px solid rgba(255,255,255,0.1)',
+          paddingTop: 'env(safe-area-inset-top)', paddingRight: 'env(safe-area-inset-right)',
+          paddingBottom: 'env(safe-area-inset-bottom)',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '18px 18px 12px' }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 17, fontWeight: 700, color: '#fff' }}>{title}</div>
+            <div style={{ fontSize: 12, color: 'rgba(255,255,255,0.4)', marginTop: 2 }}>
+              {tracks.length} {tracks.length % 10 === 1 && tracks.length % 100 !== 11 ? 'трек'
+                : [2, 3, 4].includes(tracks.length % 10) && ![12, 13, 14].includes(tracks.length % 100) ? 'трека' : 'треков'}
+            </div>
+          </div>
+          <button style={{ ...topBtn, padding: '8px 14px', fontSize: 14 }} onClick={onClose}>Закрыть</button>
+        </div>
+        {/* html/body стоят на touch-action: none — списку нужен явный pan-y, иначе на iPad он не прокрутится */}
+        <div className="lib-scroll" style={{ flex: 1, overflowY: 'auto', touchAction: 'pan-y', padding: '0 12px 18px' }}>
+          {tracks.map((t, i) => {
+            const active = i === currentIndex
+            return (
+              <button
+                key={t.id}
+                onClick={() => onPick(i)}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 12, width: '100%', textAlign: 'left',
+                  padding: '12px 12px', marginBottom: 4, borderRadius: 12, cursor: 'pointer',
+                  border: active ? '1.5px solid rgba(255,255,255,0.35)' : '1.5px solid transparent',
+                  background: active ? 'rgba(255,255,255,0.12)' : 'rgba(255,255,255,0.03)',
+                  WebkitTapHighlightColor: 'transparent',
+                }}
+              >
+                <span style={{
+                  width: 26, flexShrink: 0, textAlign: 'center', fontSize: 12, fontFamily: 'monospace',
+                  color: active ? '#fff' : 'rgba(255,255,255,0.3)',
+                }}>
+                  {active && isPlaying ? '▶' : i + 1}
+                </span>
+                <span style={{ flex: 1, minWidth: 0 }}>
+                  <span style={{
+                    display: 'block', fontSize: 15, color: active ? '#fff' : 'rgba(255,255,255,0.85)',
+                    fontWeight: active ? 600 : 400,
+                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                  }}>
+                    {t.title}
+                  </span>
+                  <span style={{
+                    display: 'block', fontSize: 12, color: 'rgba(255,255,255,0.4)', marginTop: 2,
+                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                  }}>
+                    {t.artist}
+                  </span>
+                </span>
+              </button>
+            )
+          })}
+          {!tracks.length && (
+            <div style={{ color: 'rgba(255,255,255,0.3)', fontSize: 14, textAlign: 'center', padding: 30 }}>
+              В этой папке пока нет треков.
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+})
+
 export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void }) {
   const { user, logout } = useAuth()
   const allowed = (user?.categories ?? []) as string[]
@@ -247,17 +333,20 @@ export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void
   // Per-venue feature flags. Opt-out: undefined (old cached user) means allowed.
   const canFolders = user?.allowFolderSelector !== false
   const canShuffle = user?.allowShuffle !== false
+  // Opt-IN: список треков показывается только если админ его включил клиенту.
+  const canTrackList = user?.allowTrackList === true
 
   const {
     tracks, currentTrack, currentIndex,
     isPlaying, currentTime, duration,
-    loading, togglePlay, next, seek, replaceQueueAndPlay,
+    loading, togglePlay, next, seek, selectTrack, replaceQueueAndPlay,
     volume, setVolume, volumeControllable, shuffle, toggleShuffle,
   } = usePlayer()
 
   const { library, loading: libLoading } = useLibrary()
 
   const [activeCat, setActiveCat]     = useState<string>(() => initialCat(allowed))
+  const [listOpen, setListOpen]       = useState(false)
   const [cover, setCover]             = useState(randCover())
   const [coverOpacity, setCoverOpacity] = useState(1)
 
@@ -294,6 +383,11 @@ export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void
     // eslint-disable-next-line react-hooks/set-state-in-effect -- sync UI to external (audio) state
     if (c === 'morning' || c === 'day' || c === 'evening' || c === 'all') setActiveCat(c)
   }, [currentTrack?.category])
+
+  // Stable so the memoized list does not re-render on every currentTime tick.
+  // The panel stays open on purpose: the point is browsing the folder, not a
+  // one-shot pick, and the playing row is highlighted as you go.
+  const pickTrack = useCallback((index: number) => { selectTrack(index) }, [selectTrack])
 
   const switchCategory = useCallback((cat: string) => {
     if (libLoading || cat === activeCat) return
@@ -386,6 +480,7 @@ export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void
         right: 'calc(16px + env(safe-area-inset-right))',
         zIndex: 10000, display: 'flex', gap: 8,
       }}>
+        {canTrackList && <button style={topBtn} onClick={() => setListOpen(true)}>Треки</button>}
         {onOpenAdmin && <button style={topBtn} onClick={onOpenAdmin}>Админка</button>}
         <button style={topBtn} onClick={logout}>Выйти</button>
       </div>
@@ -589,6 +684,17 @@ export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void
         )}
 
       </div>
+
+      {canTrackList && listOpen && (
+        <TrackList
+          tracks={tracks}
+          currentIndex={currentIndex}
+          isPlaying={isPlaying}
+          title={catLabel(activeCat)}
+          onPick={pickTrack}
+          onClose={() => setListOpen(false)}
+        />
+      )}
     </div>
   )
 }

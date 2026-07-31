@@ -32,6 +32,8 @@ const CROSSFADE_SEC = 6
 const HANDOFF_SEC = 0.4
 /** Quick fade for a manual next/prev — long enough to avoid a click. */
 const SWITCH_SEC = 0.25
+/** Minimum spacing between two actual skips; taps inside it are coalesced. */
+const SKIP_MIN_GAP_MS = 350
 /** How many upcoming tracks to pull into the offline cache. */
 const PRELOAD_AHEAD = 3
 /** Throttle for writing the resume-point to localStorage. */
@@ -123,6 +125,9 @@ export function usePlayer() {
   const intendedPos = useRef(0)
   /** Monotonic switch token — only the newest switch may finish (last write wins). */
   const switchSeq   = useRef(0)
+  /** Pending trailing skip (see scheduleSkip) and when the last one actually ran. */
+  const skipTimer   = useRef<number | null>(null)
+  const lastSkipAt  = useRef(0)
   const volumeRef   = useRef(0.7)
   const shuffleRef  = useRef(false)
   const categoryRef = useRef<Category | null>(null)
@@ -196,6 +201,10 @@ export function usePlayer() {
     return () => {
       window.removeEventListener('pointerdown', kick)
       window.removeEventListener('keydown', kick)
+      if (skipTimer.current !== null) { window.clearTimeout(skipTimer.current); skipTimer.current = null }
+      // Nothing downstream cares any more: drop the in-flight preload, stop both
+      // elements and release their blob URLs.
+      cache.cancelPreload()
       elA.current?.pause(); elB.current?.pause()
       revokeA.current(); revokeB.current()
     }
@@ -230,8 +239,17 @@ export function usePlayer() {
     el.load()
   }, [])
 
-  /** Cache the next few tracks in the background (never blocks playback). */
+  /**
+   * Cache the next few tracks in the background (never blocks playback).
+   *
+   * Two things keep a burst of skips from drowning the browser: cache.preload()
+   * aborts whatever the previous run was still downloading, and a pending skip
+   * suppresses the run entirely — there is no point pulling three tracks that the
+   * very next tap makes irrelevant. The preload that matters starts once the
+   * queue settles.
+   */
   const preloadAhead = useCallback((fromPos: number) => {
+    if (skipTimer.current !== null) { cache.cancelPreload(); return }
     const ord = orderRef.current, ts = tracksRef.current
     if (!ord.length) return
     const urls: string[] = []
@@ -436,7 +454,16 @@ export function usePlayer() {
         // stale pause() then kills live playback and leaves the venue silent until
         // someone taps Play. Only ever pause a side that is no longer active.
         if (elFor(active.current) === elFrom) return
-        try { elFrom?.pause(); if (elFrom) elFrom.currentTime = 0 } catch { /* ignore */ }
+        if (!elFrom) return
+        try {
+          elFrom.pause()
+          elFrom.currentTime = 0
+          // Release the retired side's network + buffer. preload="auto" keeps an
+          // element downloading its track even while paused, so during a burst of
+          // skips every abandoned track kept pulling bytes in the background. The
+          // next loadInto() assigns a fresh src, so nothing is lost.
+          if (elFrom.getAttribute('src')) { elFrom.removeAttribute('src'); elFrom.load() }
+        } catch { /* ignore */ }
       }, Math.ceil(fadeSec * 1000) + 60)
 
       preloadAhead(nextPos)
@@ -448,8 +475,32 @@ export function usePlayer() {
   // Both step from the INTENDED position, not the playing one: during an in-flight
   // switch orderPosRef still holds the old value, so a burst of taps all resolved
   // to the same target and most of the skips were silently swallowed.
-  const next = useCallback(() => { void switchTo(intendedPos.current + 1, SWITCH_SEC) }, [switchTo])
-  const prev = useCallback(() => { void switchTo(intendedPos.current - 1, SWITCH_SEC) }, [switchTo])
+  const runSkip = useCallback(() => {
+    skipTimer.current = null
+    lastSkipAt.current = Date.now()
+    void switchTo(intendedPos.current, SWITCH_SEC)
+  }, [switchTo])
+
+  /**
+   * Spam guard for next/prev — COALESCING, not dropping.
+   *
+   * A lone tap runs immediately (a venue expects the button to answer). Taps that
+   * land inside SKIP_MIN_GAP_MS only move the intended position and arm one
+   * trailing switch, so five quick taps still end up five tracks further on, but
+   * the browser loads exactly one track instead of five. Ignoring the extra taps
+   * outright would be cheaper to write and worse to use: the operator would have
+   * to wait out the lockout and would silently lose presses.
+   */
+  const scheduleSkip = useCallback((delta: number) => {
+    intendedPos.current += delta          // switchTo normalises into range
+    if (skipTimer.current !== null) return          // a trailing run is already armed
+    const since = Date.now() - lastSkipAt.current
+    if (since >= SKIP_MIN_GAP_MS) { runSkip(); return }
+    skipTimer.current = window.setTimeout(runSkip, SKIP_MIN_GAP_MS - since)
+  }, [runSkip])
+
+  const next = useCallback(() => scheduleSkip(+1), [scheduleSkip])
+  const prev = useCallback(() => scheduleSkip(-1), [scheduleSkip])
   const selectTrack = useCallback((index: number) => {
     const at = orderRef.current.indexOf(index)
     void switchTo(at >= 0 ? at : 0, SWITCH_SEC)

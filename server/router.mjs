@@ -120,6 +120,8 @@ export async function handleRequest(req, res) {
         username, role, categories: cleanCats(body.categories), folderId,
         allowFolderSelector: flags.allowFolderSelector ?? true,
         allowShuffle: flags.allowShuffle ?? true,
+        // opt-IN, see sanitize(): a new screen must not appear on its own
+        allowTrackList: flags.allowTrackList ?? false,
         ...hashPassword(body.password),
       }
       addUser(newUser)
@@ -142,6 +144,7 @@ export async function handleRequest(req, res) {
           // Same opt-out normalisation as sanitize(): missing → true.
           allowFolderSelector: owner?.allowFolderSelector !== false,
           allowShuffle: owner?.allowShuffle !== false,
+          allowTrackList: owner?.allowTrackList === true,
           counts,
           sizeBytes,
         }
@@ -169,16 +172,17 @@ export async function handleRequest(req, res) {
       const flags = readFlags(body)
       const allowFolderSelector = flags.allowFolderSelector ?? true
       const allowShuffle = flags.allowShuffle ?? true
+      const allowTrackList = flags.allowTrackList ?? false   // opt-IN, см. sanitize()
       const newUser = {
         username, name, role: 'user',
         categories: singlePlaylist ? [ALL_CATEGORY] : [...CATEGORIES],
         folderId, singlePlaylist,
-        allowFolderSelector, allowShuffle,
+        allowFolderSelector, allowShuffle, allowTrackList,
         ...hashPassword(password),
       }
       addUser(newUser)
       await saveUsers()
-      return json(res, { folderId, name, username, password, singlePlaylist, allowFolderSelector, allowShuffle }, 201)
+      return json(res, { folderId, name, username, password, singlePlaylist, allowFolderSelector, allowShuffle, allowTrackList }, 201)
     }
 
     // POST /admin/clients/:folderId/reset-password
