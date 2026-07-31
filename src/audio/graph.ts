@@ -53,6 +53,27 @@ export function isSupported(): boolean {
 }
 
 /**
+ * True where the graph must be BYPASSED and the element left to play straight to
+ * the hardware.
+ *
+ * iOS suspends an AudioContext when the screen locks or Safari goes to the
+ * background, and a MediaElementSource-connected <audio> falls silent with it.
+ * That is fatal for the product's core scenario — iPad on the bar, screen off,
+ * music keeps playing — so on iOS the whole graph is skipped. The cost is no
+ * compressor and no software volume (iOS ignores HTMLAudioElement.volume anyway,
+ * so volume belongs to the hardware buttons there).
+ *
+ * iPadOS 13+ reports itself as macOS, hence the touch-points check: a real Mac
+ * has no touch screen.
+ */
+export function bypassRecommended(): boolean {
+  if (typeof navigator === 'undefined') return false
+  const ua = navigator.userAgent
+  if (/iPad|iPhone|iPod/.test(ua)) return true
+  return /Macintosh/.test(ua) && (navigator.maxTouchPoints ?? 0) > 1
+}
+
+/**
  * Attach an <audio> element to the graph, returning ITS crossfade gain node.
  * Idempotent per element.
  *

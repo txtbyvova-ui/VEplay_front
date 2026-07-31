@@ -16,9 +16,20 @@ export interface Track {
   category?: string
 }
 
+/**
+ * iOS plays straight to the hardware (see graph.bypassRecommended) — there are no
+ * gain nodes to fade with, and el.volume is ignored there, so a 6 s "crossfade"
+ * would just be two tracks at FULL volume on top of each other. Instead the next
+ * track starts a hair before the end and the old one is cut at once: no silence,
+ * no doubling.
+ */
+const DIRECT_AUDIO = graph.bypassRecommended()
+
 /** Overlap between two tracks. The next one starts this many seconds before the
  *  end of the current one, so there is never silence. */
 const CROSSFADE_SEC = 6
+/** The same hand-off point when there is no gain to fade (DIRECT_AUDIO). */
+const HANDOFF_SEC = 0.4
 /** Quick fade for a manual next/prev — long enough to avoid a click. */
 const SWITCH_SEC = 0.25
 /** How many upcoming tracks to pull into the offline cache. */
@@ -139,12 +150,20 @@ export function usePlayer() {
       // REQUIRED: without CORS-clean media a MediaElementSource emits SILENCE
       // (dev runs vite:5173 against api:3001). The API sends ACAO: *.
       el.crossOrigin = 'anonymous'
+      // Programmatic elements get no attributes from JSX. Without playsinline iOS
+      // may hand playback to its own fullscreen player, which ends background audio.
+      // Set as ATTRIBUTES: that is what WebKit honours, and lib.dom types the
+      // matching property on HTMLVideoElement only — no cast needed this way.
+      el.setAttribute('playsinline', '')
+      el.setAttribute('webkit-playsinline', '')
       return el
     }
     elA.current = make()
     elB.current = make()
     try {
-      if (graph.isSupported()) {
+      // DIRECT_AUDIO (iOS): deliberately NOT attached. A MediaElementSource ties the
+      // element's audio to the AudioContext, which iOS suspends on screen lock.
+      if (!DIRECT_AUDIO && graph.isSupported()) {
         gainA.current = graph.attach(elA.current)
         gainB.current = graph.attach(elB.current)
         graphOk.current = true
@@ -162,7 +181,8 @@ export function usePlayer() {
     // elements, and starting that on the FIRST touch (pointerdown fires well
     // before the click that drives togglePlay) gives it a head start so it's
     // finished — not racing — by the time the real play() call happens.
-    const kick = () => { void graph.resume(); void warmUpRef.current?.() }
+    // No graph on DIRECT_AUDIO — resuming would create an AudioContext for nothing.
+    const kick = () => { if (!DIRECT_AUDIO) void graph.resume(); void warmUpRef.current?.() }
     window.addEventListener('pointerdown', kick, { once: true })
     window.addEventListener('keydown', kick, { once: true })
 
@@ -351,16 +371,20 @@ export function usePlayer() {
       const elTo = elFor(to)
       if (!elTo) return
 
-      await graph.resume()
+      if (!DIRECT_AUDIO) await graph.resume()
       await warmUp()                 // bless both elements if this is the first gesture
+      // Without gain nodes there is nothing to ramp, so the hand-off is immediate:
+      // the incoming track comes in at full level and the outgoing one is cut below
+      // (fadeSec 0 → the stop timeout fires in 60 ms) instead of doubling for 6 s.
+      const fadeSec = DIRECT_AUDIO ? 0 : seconds
       applyGain(to, 0)
       try { await elTo.play() } catch (e) {
         // AbortError = play() interrupted by a fast switch/reload — harmless.
         if ((e as DOMException)?.name !== 'AbortError') { /* gesture required — stays paused */ }
       }
 
-      applyGain(to, 1, seconds)
-      applyGain(from, 0, seconds)
+      applyGain(to, 1, fadeSec)
+      applyGain(from, 0, fadeSec)
 
       active.current = to
       setOrderPos(nextPos)
@@ -376,7 +400,7 @@ export function usePlayer() {
         // someone taps Play. Only ever pause a side that is no longer active.
         if (elFor(active.current) === elFrom) return
         try { elFrom?.pause(); if (elFrom) elFrom.currentTime = 0 } catch { /* ignore */ }
-      }, Math.ceil(seconds * 1000) + 60)
+      }, Math.ceil(fadeSec * 1000) + 60)
 
       preloadAhead(nextPos)
     } finally {
@@ -404,7 +428,7 @@ export function usePlayer() {
     }
     // Play: everything below must stay inside this user gesture for iOS.
     void (async () => {
-      await graph.resume()          // resumes the ctx iff suspended — required on iOS
+      if (!DIRECT_AUDIO) await graph.resume()   // resumes the ctx iff suspended
       await warmUp()                // one-time: bless BOTH <audio> elements this session
       const el = elFor(active.current)
       if (!el) return
@@ -437,7 +461,7 @@ export function usePlayer() {
         const dur = el.duration
         if (isFinite(dur) && dur > 0) {
           // Start the next track before this one ends → no silence.
-          const fade = Math.min(CROSSFADE_SEC, dur / 3)
+          const fade = Math.min(DIRECT_AUDIO ? HANDOFF_SEC : CROSSFADE_SEC, dur / 3)
           if (!crossfading.current && dur - el.currentTime <= fade && orderRef.current.length > 0) {
             crossfading.current = true
             void switchTo(orderPosRef.current + 1, fade)
@@ -509,7 +533,12 @@ export function usePlayer() {
         saveSession({ username: user.username, category: categoryRef.current ?? '', filename: t.filename, position: el.currentTime, shuffle: shuffleRef.current })
       }
     }
-    const onVis = () => { if (document.visibilityState === 'hidden') persist() }
+    const onVis = () => {
+      if (document.visibilityState === 'hidden') { persist(); return }
+      // Back from the background: a browser may have suspended the AudioContext,
+      // and everything routed through the graph stays silent until it is resumed.
+      if (!DIRECT_AUDIO) void graph.resume()
+    }
     window.addEventListener('pagehide', persist)
     document.addEventListener('visibilitychange', onVis)
     return () => {
@@ -567,6 +596,10 @@ export function usePlayer() {
     selectTrack,
     volume,
     setVolume,
+    // False where the software volume cannot work (DIRECT_AUDIO: iOS ignores
+    // el.volume and there is no master gain). The UI must not show a slider that
+    // silently does nothing — volume there is the device's hardware buttons.
+    volumeControllable: !DIRECT_AUDIO,
     shuffle,
     toggleShuffle,
   }

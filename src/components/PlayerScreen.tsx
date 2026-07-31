@@ -252,7 +252,7 @@ export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void
     tracks, currentTrack, currentIndex,
     isPlaying, currentTime, duration,
     loading, togglePlay, next, seek, replaceQueueAndPlay,
-    volume, setVolume, shuffle, toggleShuffle,
+    volume, setVolume, volumeControllable, shuffle, toggleShuffle,
   } = usePlayer()
 
   const { library, loading: libLoading } = useLibrary()
@@ -493,6 +493,14 @@ export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void
         {/* Volume */}
         <div className="player-volume-row" style={{ display: 'flex', alignItems: 'center', gap: 10, paddingInline: 8 }}>
           <SpeakerIcon size={18} stroke="rgba(255,255,255,0.4)" />
+          {/* Where the software volume cannot work (iOS plays straight to the
+              hardware so background audio survives a screen lock), say so instead
+              of showing a slider that moves and changes nothing. */}
+          {!volumeControllable ? (
+            <span style={{ fontSize: 12, color: 'rgba(255,255,255,0.32)', letterSpacing: '0.04em' }}>
+              Громкость — кнопками устройства
+            </span>
+          ) : (
           <div
             className="player-volume-wrap"
             // 'none', not 'manipulation': 'manipulation' still lets the browser pan
@@ -517,6 +525,7 @@ export default function PlayerScreen({ onOpenAdmin }: { onOpenAdmin?: () => void
               }} />
             </div>
           </div>
+          )}
         </div>
 
         {/* Playback controls */}
