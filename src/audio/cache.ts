@@ -20,6 +20,28 @@ export interface CacheRecord {
   buf: ArrayBuffer
   size: number
   lastUsed: number
+  /** Content-Type ответа. Пустой у записей, сделанных до появления поля. */
+  mime?: string
+}
+
+/**
+ * Запасной MIME по расширению — зеркало таблицы в server/config.mjs.
+ *
+ * Blob без типа отдаётся элементу вообще без Content-Type: Chromium в этом
+ * случае снифферит контейнер и играет, а WebKit у `blob:` не имеет ни типа, ни
+ * расширения, по которым выбрать декодер. Хардкодить 'audio/mpeg' нельзя —
+ * сервер принимает семь форматов, и WAV, помеченный как mp3, сломается вернее,
+ * чем WAV без пометки.
+ */
+const MIME_BY_EXT: Record<string, string> = {
+  mp3: 'audio/mpeg', wav: 'audio/wav', flac: 'audio/flac',
+  m4a: 'audio/mp4', aac: 'audio/aac', ogg: 'audio/ogg', opus: 'audio/ogg',
+}
+
+export function mimeByExt(url: string): string {
+  const path = (() => { try { return new URL(url, location.href).pathname } catch { return url } })()
+  const ext = path.slice(path.lastIndexOf('.') + 1).toLowerCase()
+  return MIME_BY_EXT[ext] ?? ''
 }
 
 /** Strip the query (auth token) so a track keeps one stable cache key. */
@@ -55,8 +77,8 @@ function tx(db: IDBDatabase, mode: IDBTransactionMode): IDBObjectStore {
 const wrap = <T>(req: IDBRequest<T>): Promise<T | null> =>
   new Promise(resolve => { req.onsuccess = () => resolve(req.result); req.onerror = () => resolve(null) })
 
-/** Cached bytes for a track URL, or null. Touches lastUsed (LRU). */
-export async function getCached(url: string): Promise<ArrayBuffer | null> {
+/** Cached record for a track URL, or null. Touches lastUsed (LRU). */
+export async function getCached(url: string): Promise<CacheRecord | null> {
   const db = await openDb()
   if (!db) return null
   const key = cacheKey(url)
@@ -64,7 +86,19 @@ export async function getCached(url: string): Promise<ArrayBuffer | null> {
   if (!rec) return null
   // touch (fire-and-forget)
   try { tx(db, 'readwrite').put({ ...rec, lastUsed: Date.now() }) } catch { /* ignore */ }
-  return rec.buf
+  return rec
+}
+
+/**
+ * Выбросить запись из кэша.
+ *
+ * Нужно, когда элемент отверг источник: байты могли докачаться битыми, и без
+ * этого плеер будет спотыкаться об них на каждом круге плейлиста.
+ */
+export async function drop(url: string): Promise<void> {
+  const db = await openDb()
+  if (!db) return
+  try { tx(db, 'readwrite').delete(cacheKey(url)) } catch { /* ignore */ }
 }
 
 export async function isCached(url: string): Promise<boolean> {
@@ -97,10 +131,10 @@ export async function evictLRU(max = MAX_ENTRIES): Promise<void> {
 }
 
 /** Store bytes. Quota-safe: on QuotaExceededError, evict hard and retry once. */
-export async function putCached(url: string, buf: ArrayBuffer): Promise<void> {
+export async function putCached(url: string, buf: ArrayBuffer, mime = ''): Promise<void> {
   const db = await openDb()
   if (!db) return
-  const rec: CacheRecord = { url: cacheKey(url), buf, size: buf.byteLength, lastUsed: Date.now() }
+  const rec: CacheRecord = { url: cacheKey(url), buf, size: buf.byteLength, lastUsed: Date.now(), mime: mime || mimeByExt(url) }
   const write = () => new Promise<boolean>(resolve => {
     try {
       const req = tx(db, 'readwrite').put(rec)
@@ -127,11 +161,13 @@ export async function fetchAndCache(url: string, signal?: AbortSignal): Promise<
     if (await isCached(url)) return true
     const r = await fetch(url, { signal })
     if (!r.ok) return false
+    // Заголовок надо снять ДО чтения тела — потом ответ уже израсходован.
+    const mime = (r.headers.get('content-type') || '').split(';')[0].trim()
     const buf = await r.arrayBuffer()
     // Aborted while the body was streaming in: drop the bytes instead of paying
     // for an IndexedDB write (and an evictLRU pass) nobody is waiting for.
     if (signal?.aborted) return false
-    await putCached(url, buf)
+    await putCached(url, buf, mime)
     return true
   } catch {
     return false   // AbortError lands here too — a cancelled preload is not an error
@@ -177,9 +213,12 @@ export async function preload(urls: string[]): Promise<void> {
  * `revoke` must be called once the element is done with it.
  */
 export async function playableUrl(url: string): Promise<{ src: string; revoke: () => void }> {
-  const buf = await getCached(url)
-  if (!buf) return { src: url, revoke: () => {} }
-  const blobUrl = URL.createObjectURL(new Blob([buf]))
+  const rec = await getCached(url)
+  if (!rec) return { src: url, revoke: () => {} }
+  // Тип ОБЯЗАТЕЛЕН: по сети сервер отдаёт Content-Type, и blob без него — это
+  // регресс относительно сетевого пути (см. MIME_BY_EXT выше).
+  const type = rec.mime || mimeByExt(url)
+  const blobUrl = URL.createObjectURL(type ? new Blob([rec.buf], { type }) : new Blob([rec.buf]))
   return { src: blobUrl, revoke: () => URL.revokeObjectURL(blobUrl) }
 }
 
