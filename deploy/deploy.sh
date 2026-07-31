@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Обновление прода: git pull → npm ci → build → pm2 reload.
-# Запускать от пользователя veplay из любого места: bash /opt/veplay/app/deploy/deploy.sh
+# На боевом сервере приложение работает под root (пользователя veplay нет),
+# поэтому запускать от root из любого места:
+#   bash /opt/veplay/app/deploy/deploy.sh
+# Подробности схемы — в README_DEPLOY.md.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

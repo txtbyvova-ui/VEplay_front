@@ -1,44 +1,117 @@
-# Деплой VEgroove Play на голый Ubuntu VPS
+# Деплой VEgroove Play на VPS
 
-Целевая среда: Ubuntu 22.04/24.04, домен **play.vegroove.tech**, IP **92.246.138.135**.
-Стек: Node 24 + pm2 (бэкенд `server.mjs`) + Caddy (статика фронта, reverse-proxy, авто-HTTPS).
+Боевой сервер: **play.vegroove.tech**, IP **92.246.138.135**, Ubuntu 26.04 LTS.
+Стек: Node 24 + pm2 (бэкенд `server.mjs`) + Caddy (статика фронта, reverse-proxy,
+авто-HTTPS). Docker не используется.
 
-## 0. DNS — сделать ДО всего остального
+> Документ описывает то, как сервер устроен **на самом деле**. Раньше здесь была
+> схема с отдельным пользователем `veplay` — на боевой машине её нет, всё работает
+> под `root`. См. «Почему под root» в конце.
 
-Сейчас `play.vegroove.tech` — CNAME на Vercel. Пока это так, Caddy **не получит
-сертификат** Let's Encrypt. В DNS-панели домена:
+---
 
-1. Удалить CNAME для `play`.
-2. Создать `A`-запись: `play` → `92.246.138.135`.
-3. (Опционально) `AAAA`-запись на адрес из вашей IPv6-подсети `2a12:5940:dbcd::/48` —
-   только если этот адрес реально поднят на интерфейсе VPS (`ip -6 addr`).
+## Как это работает сейчас
 
-Проверка: `dig +short play.vegroove.tech` → `92.246.138.135`.
+| Что | Где |
+|-----|-----|
+| Код | `/opt/veplay/app` — git-клон, ветка `main`, remote `origin` |
+| Процесс | pm2 (`/root/.pm2`), приложение зарегистрировано как **`veplay`** |
+| Бэкенд | `node /opt/veplay/app/server.mjs`, слушает `127.0.0.1:3001` |
+| Статика | `/opt/veplay/app/dist`, раздаёт Caddy |
+| Данные | `/var/vegroove` — `users.json`, `.secret`, `music/<клиент>/…` |
+| Конфиг Caddy | `/etc/caddy/Caddyfile` (копия `deploy/Caddyfile`) |
+| Автозапуск | systemd-юнит `pm2-root` (`systemctl is-enabled pm2-root` → `enabled`) |
 
-## 1. Базовая система (от root)
+Переменные окружения процесса задаёт `deploy/ecosystem.config.cjs`
+(`PORT`, `HOST`, `MUSIC_ROOT`, `DATA_DIR`, `CLASSIFY_*`, `REQUEST_TIMEOUT_MS`).
+
+Всё выполняется **от root**, никакого `sudo -u veplay` — такого пользователя нет.
+
+---
+
+## Обновление прода (основной сценарий)
+
+```bash
+ssh root@92.246.138.135
+bash /opt/veplay/app/deploy/deploy.sh
+```
+
+Скрипт делает `git pull --ff-only` → `npm ci` → `npm run build` → `pm2 startOrReload`
+→ `pm2 save`. Без даунтайма: старая статика отдаётся до конца сборки, бэкенд
+перезапускается за доли секунды.
+
+### Проверка после обновления
+
+```bash
+pm2 status                                              # veplay → online
+curl -sI https://play.vegroove.tech | head -1           # 200
+curl -sI http://play.vegroove.tech  | head -1           # 308 → https
+curl -s  https://play.vegroove.tech/auth/me             # {"error":"Unauthorized"} — API жив
+```
+
+Что новая сборка реально доехала до браузера, видно по имени бандла:
+
+```bash
+curl -s https://play.vegroove.tech | grep -o 'assets/index-[A-Za-z0-9_-]*\.js'
+```
+
+Оно должно совпадать с тем, что вывел `vite build`, и меняться от сборки к сборке.
+
+### Откат
+
+```bash
+cd /opt/veplay/app
+git log --oneline -5            # выбрать предыдущий коммит
+git checkout -B main <коммит>
+npm ci && npm run build
+pm2 reload veplay
+```
+
+Перед рискованным обновлением можно снять снимок каталога:
+
+```bash
+tar czf /root/veplay-backup-$(date +%Y%m%d-%H%M%S).tar.gz \
+    --exclude=node_modules -C /opt/veplay app
+```
+
+Восстановление — распаковать поверх `/opt/veplay` и `pm2 reload veplay`.
+
+---
+
+## Установка с нуля (новый сервер)
+
+### 0. DNS — до всего остального
+
+`play.vegroove.tech` должен быть `A`-записью на IP сервера. Пока домен смотрит
+куда-то ещё (например, CNAME на Vercel), Caddy **не получит сертификат**
+Let's Encrypt.
+
+```bash
+dig +short play.vegroove.tech        # → IP сервера
+```
+
+### 1. Базовая система
 
 ```bash
 apt update && apt -y upgrade
 apt -y install git curl ufw
 
-# файрвол: SSH + HTTP/HTTPS
 ufw allow OpenSSH
 ufw allow 80/tcp
 ufw allow 443/tcp
 ufw --force enable
 ```
 
-## 2. Node 24 LTS + pm2
+### 2. Node 24 + pm2
 
 ```bash
 curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
 apt -y install nodejs
-node -v            # v24.x
-
+node -v                      # v24.x
 npm install -g pm2
 ```
 
-## 3. Caddy
+### 3. Caddy
 
 ```bash
 apt -y install debian-keyring debian-archive-keyring apt-transport-https
@@ -49,58 +122,92 @@ curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
 apt update && apt -y install caddy
 ```
 
-## 4. Пользователь и каталоги
+### 4. Каталоги и код
 
 ```bash
-# отдельный пользователь для приложения
-useradd -m -s /bin/bash veplay
+# данные вне репозитория — переживают любой redeploy
+mkdir -p /var/vegroove/music
+chmod 750 /var/vegroove
 
 # код
 mkdir -p /opt/veplay
-chown veplay:veplay /opt/veplay
-
-# данные (вне репозитория, переживают любой redeploy):
-#   /var/vegroove/users.json  /var/vegroove/.secret  /var/vegroove/music/<клиент>/...
-mkdir -p /var/vegroove/music
-chown -R veplay:veplay /var/vegroove
-chmod 750 /var/vegroove
-```
-
-## 5. Клон и сборка
-
-```bash
-su - veplay
 git clone https://github.com/txtbyvova-ui/VEplay_front.git /opt/veplay/app
 cd /opt/veplay/app
-
-# фронту нужен адрес API на этапе сборки
-cp .env.example .env
-sed -i 's|^VITE_API_BASE=.*|VITE_API_BASE=https://play.vegroove.tech|' .env
-
 npm ci
-npm run build       # tsc -b && vite build → dist/
+npm run build                # tsc -b && vite build → dist/
 ```
 
-## 5б. Классификатор VEclassify (Python-мост)
-
-Админка умеет загрузить целую папку mp3 и автоматически разложить треки по
-`morning`/`day`/`evening` (VEclassify: librosa + Gemini). Node запускает Python
-как подпроцесс — его надо развернуть рядом с приложением.
+Отдельный `.env` для сборки **не нужен**: в репозитории лежит `.env.production`
+с пустым `VITE_API_BASE`, и фронт ходит относительными путями на тот же домен
+через Caddy. Проверить, что в бандле не осталось `localhost`:
 
 ```bash
-# системные зависимости для librosa / soundfile / декодирования аудио
+grep -c 'localhost:3001' dist/assets/index-*.js     # → 0
+```
+
+### 5. Первый запуск бэкенда
+
+Пароль первого администратора задаётся **только при самом первом старте** (иначе
+будет `admin`/`admin`, сервер напишет об этом в лог, а UI будет требовать смену).
+
+```bash
+cd /opt/veplay/app
+MUSIC_ROOT=/var/vegroove/music DATA_DIR=/var/vegroove \
+ADMIN_USER=admin ADMIN_PASS='ВАШ_НАДЁЖНЫЙ_ПАРОЛЬ' node server.mjs
+# в логе "Seeded default admin" → Ctrl+C
+```
+
+Дальше под pm2 + автозапуск после ребута:
+
+```bash
+pm2 startOrReload deploy/ecosystem.config.cjs
+pm2 save
+pm2 startup systemd -u root --hp /root
+# выполнить команду, которую выведет pm2 startup
+```
+
+### 6. Caddy
+
+```bash
+cp /opt/veplay/app/deploy/Caddyfile /etc/caddy/Caddyfile
+systemctl reload caddy
+```
+
+Сертификат Let's Encrypt и редирект http→https Caddy делает сам.
+
+### 7. Проверка
+
+Команды — из раздела «Проверка после обновления» выше, плюс:
+
+```bash
+reboot                       # после ребута pm2 должен поднять veplay сам
+```
+
+Дальше — зайти под админом, создать первого клиента (папка, логин и одноразовый
+пароль создаются автоматически; там же выбирается режим — «по времени суток» или
+«единый плейлист») и загрузить аудио.
+
+---
+
+## VEclassify (автораскладка папки по времени суток) — опционально
+
+**На боевом сервере сейчас НЕ развёрнут.** `CLASSIFY_PYTHON` / `CLASSIFY_SCRIPT`
+в `ecosystem.config.cjs` на него указывают, но каталога нет, поэтому кнопка
+«Классифицировать папку» в админке уходит в статус `error`. Остальной функционал
+от этого не страдает — треки грузятся вручную по категориям.
+
+Чтобы включить:
+
+```bash
 apt -y install python3.12 python3.12-venv ffmpeg libsndfile1
 
-su - veplay
-# VEclassify — сосед каталога app (сервер по умолчанию ищет ../VEclassify)
-git clone <repo-VEclassify> /opt/veplay/VEclassify        # или скопировать каталог
+git clone <repo-VEclassify> /opt/veplay/VEclassify     # сосед каталога app
 cd /opt/veplay/VEclassify
 python3.12 -m venv .venv
-.venv/bin/pip install -r requirements.txt                 # librosa, mutagen, google-genai, ...
+.venv/bin/pip install -r requirements.txt              # librosa, mutagen, google-genai, …
 
-# Gemini-ключ с РАБОЧЕЙ квотой (free-tier быстро исчерпывается → батч уйдёт в error)
 cp .env.example .env
-sed -i 's|^GEMINI_API_KEY=.*|GEMINI_API_KEY=ВАШ_КЛЮЧ|' .env
+sed -i 's|^GEMINI_API_KEY=.*|GEMINI_API_KEY=ВАШ_КЛЮЧ|' .env    # квота должна быть рабочей
 ```
 
 Проверка моста:
@@ -110,82 +217,47 @@ sed -i 's|^GEMINI_API_KEY=.*|GEMINI_API_KEY=ВАШ_КЛЮЧ|' .env
 # нет папки/ключа/пусто → exit 1 с сообщением в stderr; успех → {"tracks":[...]}
 ```
 
-`CLASSIFY_PYTHON` / `CLASSIFY_SCRIPT` уже заданы в `deploy/ecosystem.config.cjs`.
-Staging загрузок — `MUSIC_ROOT/_incoming/<batchId>/` (временное, сервер чистит сам);
-состояние батчей — `DATA_DIR/pending_batches.json`. Оба уже в `.gitignore`.
+Staging загрузок — `MUSIC_ROOT/_incoming/<batchId>/` (временное, сервер чистит
+сам); состояние батчей — `DATA_DIR/pending_batches.json`. Оба в `.gitignore`.
 
-## 6. Первый запуск бэкенда
+---
 
-Пароль первого администратора: задайте свой ДО первого старта (иначе будет
-`admin`/`admin` — сервер напишет об этом в лог, а UI будет требовать смену).
+## Почему под root (и как это исправить потом)
 
-```bash
-# всё ещё под veplay, в /opt/veplay/app
-ADMIN_USER=admin ADMIN_PASS='ВАШ_НАДЁЖНЫЙ_ПАРОЛЬ' node server.mjs
-# убедиться, что в логе "Seeded default admin", затем Ctrl+C
-```
+Исторически код заливали на сервер копированием с рабочей машины, а процесс
+подняли от `root` — отдельного пользователя приложения так и не появилось. Это
+работает, но лишняя привилегия: скомпрометированный бэкенд получает весь сервер.
 
-`ADMIN_USER`/`ADMIN_PASS` действуют только при самом первом запуске — потом
-пользователи живут в `/var/vegroove/users.json`.
-
-Запуск под pm2 + автостарт после ребута:
+Миграция, когда дойдут руки (делать в окно обслуживания):
 
 ```bash
-pm2 startOrReload deploy/ecosystem.config.cjs
-pm2 save
-exit                              # обратно в root
-env PATH=$PATH pm2 startup systemd -u veplay --hp /home/veplay
-# выполнить команду, которую выведет pm2 startup (она уже с sudo)
+useradd -m -s /bin/bash veplay
+chown -R veplay:veplay /opt/veplay /var/vegroove
+pm2 delete veplay                                    # снять с root
+su - veplay -c 'cd /opt/veplay/app && pm2 startOrReload deploy/ecosystem.config.cjs && pm2 save'
+pm2 startup systemd -u veplay --hp /home/veplay      # от root, затем выполнить выведенную команду
+systemctl disable pm2-root
 ```
 
-## 7. Caddy: статика + proxy + HTTPS
+После этого все команды из этого документа выполняются через
+`sudo -u veplay …`, а `deploy.sh` — как `sudo -u veplay bash /opt/veplay/app/deploy/deploy.sh`.
 
-```bash
-cp /opt/veplay/app/deploy/Caddyfile /etc/caddy/Caddyfile
-systemctl reload caddy
-```
-
-Caddy сам получит сертификат Let's Encrypt (нужен уже переключённый DNS, шаг 0)
-и сам редиректит http→https.
-
-## 8. Проверка
-
-```bash
-curl -I  https://play.vegroove.tech                     # 200, статика
-curl -sI http://play.vegroove.tech | head -1            # 308 → https
-curl -s  https://play.vegroove.tech/auth/me             # {"error":"Unauthorized"} — API жив
-pm2 status                                              # veplay online
-reboot                                                  # после ребута pm2 должен поднять veplay сам
-```
-
-Дальше — зайти на https://play.vegroove.tech под админом, создать первого
-клиента (папка + логин + одноразовый пароль создаются автоматически; там же
-выбирается режим — «по времени суток» или «единый плейлист») и либо загрузить
-аудио по категориям вручную, либо нажать «Классифицировать папку» и разложить
-целую папку автоматически (нужен рабочий VEclassify из шага 5б; для режима
-«единый плейлист» классификатор недоступен — расписания там нет).
-
-## 9. Обновление (после git push)
-
-```bash
-sudo -u veplay bash /opt/veplay/app/deploy/deploy.sh
-```
-
-(git pull → npm ci → build → pm2 reload — без даунтайма.)
+---
 
 ## Заметки
 
-- Бэкенд слушает только `127.0.0.1:3001` (`HOST` в ecosystem-конфиге) — снаружи
-  доступен только через Caddy.
-- Rate-limit на `/auth/login`: 10 попыток / 15 минут с одного IP; реальный IP
-  берётся из `X-Forwarded-For` только для соединений с localhost (т.е. от Caddy).
+- Бэкенд слушает только `127.0.0.1:3001` — снаружи доступен исключительно через Caddy.
+- Rate-limit на `/auth/login`: 10 попыток / 15 минут с одного IP; реальный IP берётся
+  из `X-Forwarded-For` только для соединений с localhost (то есть от Caddy).
 - Лимиты загрузки: **ручная** (по категории) — форматы `.mp3 .wav .flac .m4a .aac .ogg
   .opus`, ≤ 200 МБ/файл, лимита на количество файлов за раз нет (каждый файл
   принимается или отклоняется отдельно, отклонённые перечислены в ответе);
   **классификатор папки** — только `.mp3`, до 500 файлов и `MAX_UPLOAD_BYTES`
   (дефолт 2 ГБ) на батч, время запроса ограничено `REQUEST_TIMEOUT_MS` (дефолт 1 ч —
-  поднят с Node-дефолта 300с, который давал 408 на больших/медленных загрузках).
+  поднят с Node-дефолта 300 с, который давал 408 на больших/медленных загрузках).
 - Классификация зависит от квоты Gemini-ключа: при 429/невалидном ключе батч
   корректно уходит в статус `error` (сервер жив), а не виснет.
-- Бэкап = скопировать `/var/vegroove` целиком (users.json, .secret,
-  pending_batches.json, музыка) + `/opt/veplay/VEclassify/.env` (Gemini-ключ).
+- **Бэкап** = скопировать `/var/vegroove` целиком (users.json, .secret,
+  pending_batches.json, музыка). Код бэкапить не нужно — он в git.
+- На той же машине живут посторонние сервисы (`/opt/neurozabelin`, `xray` на
+  портах 10808/10809) — к VEplay отношения не имеют, не трогать.
