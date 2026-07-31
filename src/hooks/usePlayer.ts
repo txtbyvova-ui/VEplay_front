@@ -116,6 +116,13 @@ export function usePlayer() {
   const tracksRef   = useRef<Track[]>([])
   const orderRef    = useRef<number[]>([])
   const orderPosRef = useRef(0)
+  /** Position the user has ASKED for, updated synchronously. orderPosRef only moves
+   *  once a switch has actually landed, so computing "next" from it made every tap
+   *  during an in-flight switch aim at the SAME track — eight quick taps advanced
+   *  the queue by one and the rest were silently swallowed. */
+  const intendedPos = useRef(0)
+  /** Monotonic switch token — only the newest switch may finish (last write wins). */
+  const switchSeq   = useRef(0)
   const volumeRef   = useRef(0.7)
   const shuffleRef  = useRef(false)
   const categoryRef = useRef<Category | null>(null)
@@ -202,11 +209,20 @@ export function usePlayer() {
     return data.map(t => ({ ...t, src: resolveSrc(t.src, token) }))
   }, [token])
 
-  /** Put a track into one side, preferring the offline cache. */
-  const loadInto = useCallback(async (side: Side, track: Track) => {
+  /**
+   * Put a track into one side, preferring the offline cache.
+   *
+   * `stillWanted` is checked AFTER the async cache lookup and BEFORE the element
+   * is touched: during a burst of taps several loads are in flight at once, and a
+   * late-arriving stale one used to overwrite src + call load() on the side a
+   * newer switch had already started — aborting its play() and leaving the player
+   * sitting on a paused track.
+   */
+  const loadInto = useCallback(async (side: Side, track: Track, stillWanted?: () => boolean) => {
     const el = elFor(side)
     if (!el) return
     const { src, revoke } = await cache.playableUrl(track.src)
+    if (stillWanted && !stillWanted()) { revoke(); return }
     // blob: URLs are same-origin — crossOrigin must be cleared or Safari refuses.
     el.crossOrigin = src.startsWith('blob:') ? null : 'anonymous'
     if (side === 'A') { revokeA.current(); revokeA.current = revoke } else { revokeB.current(); revokeB.current = revoke }
@@ -245,6 +261,7 @@ export function usePlayer() {
         setShuffle(useShuffle)
         setOrder(ord)
         setOrderPos(Math.max(0, ord.indexOf(startIdx)))
+        intendedPos.current = Math.max(0, ord.indexOf(startIdx))
         setLoading(false)
         // Restore the exact position; playback stays paused until the user taps
         // (browsers block un-gestured autoplay anyway).
@@ -281,6 +298,7 @@ export function usePlayer() {
           const ord = shuffleRef.current ? shuffledOrder(list.length) : identityOrder(list.length)
           setOrder(ord)
           setOrderPos(0)
+          intendedPos.current = 0
         }).catch(() => {})
       }
     }, 60_000)
@@ -364,33 +382,52 @@ export function usePlayer() {
     const track = ts[ord[nextPos]]
     if (!track) return
 
+    intendedPos.current = nextPos
+    const my = ++switchSeq.current
+    const superseded = () => switchSeq.current !== my
+
     const from = active.current
     const to   = other(from)
     try {
-      await loadInto(to, track)
+      await loadInto(to, track, () => !superseded())
+      if (superseded()) return       // a newer tap already owns this side
       const elTo = elFor(to)
       if (!elTo) return
 
       if (!DIRECT_AUDIO) await graph.resume()
       await warmUp()                 // bless both elements if this is the first gesture
+      if (superseded()) return
       // Without gain nodes there is nothing to ramp, so the hand-off is immediate:
       // the incoming track comes in at full level and the outgoing one is cut below
       // (fadeSec 0 → the stop timeout fires in 60 ms) instead of doubling for 6 s.
       const fadeSec = DIRECT_AUDIO ? 0 : seconds
       applyGain(to, 0)
-      try { await elTo.play() } catch (e) {
-        // AbortError = play() interrupted by a fast switch/reload — harmless.
-        if ((e as DOMException)?.name !== 'AbortError') { /* gesture required — stays paused */ }
-      }
 
-      applyGain(to, 1, fadeSec)
-      applyGain(from, 0, fadeSec)
-
+      // `active` must move BEFORE play(): the play/playing/pause listeners ignore
+      // every event that does not come from the ACTIVE side, so starting the new
+      // element while `active` still pointed at the old one dropped its 'play'
+      // event on the floor and left isPlaying frozen at whatever it was.
       active.current = to
       setOrderPos(nextPos)
       orderPosRef.current = nextPos
       setCurrentTime(0)
+
+      try { await elTo.play() } catch (e) {
+        // AbortError = play() interrupted by a fast switch/reload — harmless.
+        if ((e as DOMException)?.name !== 'AbortError') { /* refused — handled below */ }
+      }
+      if (superseded()) return
+
+      applyGain(to, 1, fadeSec)
+      applyGain(from, 0, fadeSec)
       setDuration(isFinite(elTo.duration) ? elTo.duration : 0)
+
+      // The authoritative moment: whatever the events did or did not deliver, the
+      // element itself knows the truth. Without this a refused play() (iOS says no
+      // to programmatic playback outside a gesture) left isPlaying stuck on true —
+      // silence with a spinning vinyl, and a Play button that could no longer
+      // recover it because togglePlay was pausing an already-paused element.
+      setIsPlaying(!elTo.paused)
 
       const elFrom = elFor(from)
       window.setTimeout(() => {
@@ -408,22 +445,27 @@ export function usePlayer() {
     }
   }, [applyGain, loadInto, preloadAhead, warmUp])
 
-  const next = useCallback(() => { void switchTo(orderPosRef.current + 1, SWITCH_SEC) }, [switchTo])
-  const prev = useCallback(() => { void switchTo(orderPosRef.current - 1, SWITCH_SEC) }, [switchTo])
+  // Both step from the INTENDED position, not the playing one: during an in-flight
+  // switch orderPosRef still holds the old value, so a burst of taps all resolved
+  // to the same target and most of the skips were silently swallowed.
+  const next = useCallback(() => { void switchTo(intendedPos.current + 1, SWITCH_SEC) }, [switchTo])
+  const prev = useCallback(() => { void switchTo(intendedPos.current - 1, SWITCH_SEC) }, [switchTo])
   const selectTrack = useCallback((index: number) => {
     const at = orderRef.current.indexOf(index)
     void switchTo(at >= 0 ? at : 0, SWITCH_SEC)
   }, [switchTo])
 
   // ── play / pause ──────────────────────────────────────────────────────────
-  // NOTE: this handler NEVER calls setIsPlaying itself. The UI is bound strictly
-  // to the elements' native 'play'/'playing'/'pause' events (see the effect
-  // below), so the icon always mirrors what audio is really doing — even when
-  // iOS silently refuses a play(). That is what keeps the button alive forever.
+  // The UI stays bound to the elements' native 'play'/'playing'/'pause' events, so
+  // the icon mirrors what audio is really doing. But the DECISION here is taken
+  // from the element, never from React state: if the two ever disagree, acting on
+  // stale state made the button pause an already-paused element (no event, no
+  // change) and it looked dead. Reading el.paused makes it impossible to wedge.
   const togglePlay = useCallback(() => {
-    if (playingRef.current) {
-      // Pause: just pause — the native 'pause' event flips the UI.
-      elFor(active.current)?.pause()
+    const cur = elFor(active.current)
+    if (cur && !cur.paused) {
+      // Really playing → pause. The native 'pause' event flips the UI.
+      cur.pause()
       return
     }
     // Play: everything below must stay inside this user gesture for iOS.
@@ -436,13 +478,15 @@ export function usePlayer() {
       if (!el.src && ts.length) await loadInto(active.current, ts[ord[orderPosRef.current] ?? 0])
       applyGain(active.current, 1)
       try {
-        await el.play()             // UI flips via the 'play' event, not here
+        await el.play()             // normally the UI flips via the 'play' event
       } catch (e) {
         // AbortError = play() interrupted by a quick pause()/reload — harmless.
-        // Any other rejection: the element stays paused and the absence of a
-        // 'play' event keeps the UI truthful, so no manual state juggling.
-        if ((e as DOMException)?.name !== 'AbortError') { /* stays paused */ }
+        if ((e as DOMException)?.name !== 'AbortError') { /* refused — see below */ }
       }
+      // Backstop for the case the event cannot deliver: an element that was ALREADY
+      // playing fires no 'play', and a refused play() fires nothing at all. Either
+      // way the element knows the truth, so take it from there.
+      setIsPlaying(!el.paused)
     })()
   }, [applyGain, loadInto, warmUp])
 
@@ -464,7 +508,7 @@ export function usePlayer() {
           const fade = Math.min(DIRECT_AUDIO ? HANDOFF_SEC : CROSSFADE_SEC, dur / 3)
           if (!crossfading.current && dur - el.currentTime <= fade && orderRef.current.length > 0) {
             crossfading.current = true
-            void switchTo(orderPosRef.current + 1, fade)
+            void switchTo(intendedPos.current + 1, fade)
           }
           // Throttled resume-point.
           const now = Date.now()
@@ -483,7 +527,7 @@ export function usePlayer() {
       // Safety net: the faded-OUT element also fires 'ended' (it plays to its
       // natural end behind the crossfade) — ignore it, `active` already moved on.
       // Only an 'ended' on the ACTIVE side means the crossfade never ran.
-      const onEnded = () => { if (active.current === side) { crossfading.current = false; void switchTo(orderPosRef.current + 1, SWITCH_SEC) } }
+      const onEnded = () => { if (active.current === side) { crossfading.current = false; void switchTo(intendedPos.current + 1, SWITCH_SEC) } }
       // UI state is driven STRICTLY by the element's own events, so the icon can
       // never disagree with what audio is actually doing (even when iOS refuses a
       // play()). `warming` skips the one-time unlock priming; the `active` check
@@ -560,6 +604,7 @@ export function usePlayer() {
       const ord = on ? shuffledOrder(tracksRef.current.length, cur) : identityOrder(tracksRef.current.length)
       setOrder(ord)
       setOrderPos(Math.max(0, ord.indexOf(cur)))
+      intendedPos.current = Math.max(0, ord.indexOf(cur))
       return on
     })
   }, [])
