@@ -26,15 +26,17 @@ let master: GainNode | null = null
 /**
  * MediaElementSource may be created only ONCE per element — remember them.
  *
- * DO NOT tear this graph down on a track change. The whole graph is a FIXED set —
- * one AudioContext, two MediaElementSource, two GainNode, a compressor and the
- * master — built once for the two <audio> elements and never grown, so skipping
- * tracks accumulates nothing to clean up. Calling disconnect()/close() per skip
- * would free nothing and would be unrecoverable: createMediaElementSource() on an
- * element that already has one throws InvalidStateError, so the next attach()
- * would kill audio for the rest of the session. What actually leaks during a
- * burst of skips is network and buffers, and that is handled in cache.ts
- * (AbortController) and usePlayer (the retired element's src is released).
+ * DO NOT tear this graph down on a TRACK CHANGE. Per mount the graph is a fixed
+ * set — one AudioContext, two MediaElementSource, two GainNode, a compressor and
+ * the master — so skipping tracks accumulates nothing to clean up. Calling
+ * disconnect()/close() per skip would free nothing and would be unrecoverable:
+ * createMediaElementSource() on an element that already has one throws
+ * InvalidStateError, so the next attach() would kill audio for the session. What
+ * actually leaks during a burst of skips is network and buffers, handled in
+ * cache.ts (AbortController) and usePlayer (the retired element's src).
+ *
+ * It IS however required to detach() on UNMOUNT — see detach() below. The set is
+ * fixed per mount, not per page: a remount brings new elements and new nodes.
  */
 const sources = new WeakMap<HTMLAudioElement, { source: MediaElementAudioSourceNode; gain: GainNode }>()
 
@@ -138,6 +140,24 @@ export function setGain(gain: GainNode, to: number): void {
   const c = ensureCtx()
   gain.gain.cancelScheduledValues(c.currentTime)
   gain.gain.value = Math.min(1, Math.max(0, to))
+}
+
+/**
+ * Отцепить элемент от графа.
+ *
+ * Нужно ИМЕННО при размонтировании хука, а не при смене трека. На скипе граф не
+ * растёт (см. комментарий у `sources`), но при размонтировании `usePlayer`
+ * создаёт НОВЫЕ `new Audio()`, `attach()` промахивается мимо WeakMap и вешает
+ * ещё одну пару нод на тот же компрессор — а старая остаётся подключённой и
+ * удерживает свой `<audio>`. Замерено: +2 `MediaElementSource` за каждый заход
+ * в админку и обратно, и ни один не освобождался.
+ */
+export function detach(el: HTMLAudioElement): void {
+  const existing = sources.get(el)
+  if (!existing) return
+  try { existing.source.disconnect() } catch { /* уже отключён */ }
+  try { existing.gain.disconnect() } catch { /* уже отключён */ }
+  sources.delete(el)
 }
 
 export function contextState(): AudioContextState | 'unavailable' {

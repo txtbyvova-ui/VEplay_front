@@ -34,6 +34,14 @@ const HANDOFF_SEC = 0.4
 const SWITCH_SEC = 0.25
 /** Minimum spacing between two actual skips; taps inside it are coalesced. */
 const SKIP_MIN_GAP_MS = 350
+/**
+ * Сколько ждать события 'playing' после переключения, прежде чем считать трек
+ * залипшим. Браузер на битом/зависшем источнике может молчать десятки секунд —
+ * в зале это тишина без причины.
+ */
+const PLAY_WATCHDOG_MS = 2500
+/** Больше стольких провалов подряд — останавливаемся, а не листаем папку вечно. */
+const MAX_FAIL_STREAK = 5
 /** How many upcoming tracks to pull into the offline cache. */
 const PRELOAD_AHEAD = 3
 /** Throttle for writing the resume-point to localStorage. */
@@ -128,6 +136,18 @@ export function usePlayer() {
   /** Pending trailing skip (see scheduleSkip) and when the last one actually ran. */
   const skipTimer   = useRef<number | null>(null)
   const lastSkipAt  = useRef(0)
+  /** Ватчдог запуска трека (см. armWatchdog). `attemptSeq` — номер попытки
+   *  воспроизведения, `playingToken` — номер попытки, на которой реально пришло
+   *  событие 'playing'. Совпали — трек зазвучал. */
+  const watchdog     = useRef<number | null>(null)
+  const attemptSeq   = useRef(0)
+  const playingToken = useRef(-1)
+  /** Подряд идущие провалы источника — страховка от бесконечной карусели. */
+  const failStreak   = useRef(0)
+  /** Хук размонтирован: после этого ни переключаться, ни трогать состояние нельзя. */
+  const disposed     = useRef(false)
+  /** switchTo через ref — ватчдог и обработчик ошибок объявлены раньше него. */
+  const switchToRef  = useRef<(pos: number, seconds: number) => void>(() => {})
   const volumeRef   = useRef(0.7)
   const shuffleRef  = useRef(false)
   const categoryRef = useRef<Category | null>(null)
@@ -156,6 +176,7 @@ export function usePlayer() {
 
   // Create the two elements once and wire them into the graph.
   useEffect(() => {
+    disposed.current = false
     const make = (): HTMLAudioElement => {
       const el = new Audio()
       el.preload = 'auto'
@@ -202,10 +223,22 @@ export function usePlayer() {
       window.removeEventListener('pointerdown', kick)
       window.removeEventListener('keydown', kick)
       if (skipTimer.current !== null) { window.clearTimeout(skipTimer.current); skipTimer.current = null }
+      disposed.current = true
+      if (watchdog.current !== null) { window.clearTimeout(watchdog.current); watchdog.current = null }
       // Nothing downstream cares any more: drop the in-flight preload, stop both
       // elements and release their blob URLs.
       cache.cancelPreload()
-      elA.current?.pause(); elB.current?.pause()
+      for (const el of [elA.current, elB.current]) {
+        if (!el) continue
+        el.pause()
+        // Отцепить от графа ОБЯЗАТЕЛЬНО: следующее монтирование создаст новые
+        // элементы и новую пару нод, а эта осталась бы подключённой к компрессору
+        // и удерживала бы свой <audio>. Замерено: +2 MediaElementSource за каждый
+        // заход в админку и обратно.
+        graph.detach(el)
+        // И освободить источник, иначе брошенный элемент продолжит докачивать трек.
+        try { el.removeAttribute('src'); el.load() } catch { /* ignore */ }
+      }
       revokeA.current(); revokeB.current()
     }
   }, [applyGain])
@@ -391,6 +424,50 @@ export function usePlayer() {
   const warmUpRef = useRef(warmUp)
   useEffect(() => { warmUpRef.current = warmUp }, [warmUp])
 
+  // ── ватчдог запуска ───────────────────────────────────────────────────────
+  const clearWatchdog = useCallback(() => {
+    if (watchdog.current !== null) { window.clearTimeout(watchdog.current); watchdog.current = null }
+  }, [])
+
+  /**
+   * Сторожевой таймер на запуск трека.
+   *
+   * Симптом, ради которого он есть: элемент принял src, `play()` отработал без
+   * ошибки, а звука нет — источник битый, сеть подвисла, декодер задумался. Сам
+   * браузер в этом состоянии может молчать десятки секунд, и в зале это тишина
+   * без видимой причины. Если за PLAY_WATCHDOG_MS не пришло 'playing' — рвём
+   * источник и уходим на следующий трек.
+   *
+   * НЕ срабатывает на поставленном на паузу элементе, и это принципиально: пауза
+   * означает либо решение пользователя, либо отказ iOS в автоплее вне жеста. В
+   * обоих случаях уходить на следующий трек нельзя — иначе плеер прошуршит всю
+   * папку за секунды, потому что каждый следующий play() отклонят так же.
+   */
+  const armWatchdog = useCallback((side: Side, attempt: number) => {
+    clearWatchdog()
+    watchdog.current = window.setTimeout(() => {
+      watchdog.current = null
+      if (disposed.current) return
+      if (playingToken.current === attempt) return      // 'playing' пришёл — всё в порядке
+      const el = elFor(side)
+      if (!el || active.current !== side) return
+      if (el.paused) return                             // см. комментарий выше
+      failStreak.current++
+      console.warn(`[player] трек не зазвучал за ${PLAY_WATCHDOG_MS} мс — обрываем источник`, {
+        readyState: el.readyState, networkState: el.networkState,
+        error: el.error?.code ?? null, подряд: failStreak.current,
+      })
+      try { el.pause(); el.removeAttribute('src'); el.load() } catch { /* ignore */ }
+      if (failStreak.current > MAX_FAIL_STREAK) {
+        console.error(`[player] ${failStreak.current} треков подряд не запустились — останавливаемся`)
+        setIsPlaying(false)
+        setError('Не удаётся воспроизвести треки — проверьте связь с сервером')
+        return
+      }
+      switchToRef.current(intendedPos.current + 1, SWITCH_SEC)
+    }, PLAY_WATCHDOG_MS)
+  }, [clearWatchdog])
+
   // ── switching ─────────────────────────────────────────────────────────────
   /** Start `pos` on the idle side and cross-fade to it over `seconds`. */
   const switchTo = useCallback(async (pos: number, seconds: number) => {
@@ -430,9 +507,20 @@ export function usePlayer() {
       orderPosRef.current = nextPos
       setCurrentTime(0)
 
-      try { await elTo.play() } catch (e) {
+      // Ватчдог взводится ДО play(): если промис вообще не settle-ится (а такое
+      // бывает), сработает он.
+      const attempt = ++attemptSeq.current
+      armWatchdog(to, attempt)
+      try {
+        await elTo.play()
+      } catch (e) {
+        const err = e as DOMException
         // AbortError = play() interrupted by a fast switch/reload — harmless.
-        if ((e as DOMException)?.name !== 'AbortError') { /* refused — handled below */ }
+        if (err?.name !== 'AbortError') {
+          // Чаще всего NotAllowedError на iOS: автоплей вне жеста. Состояние ниже
+          // всё равно сверяется с элементом, так что UI честно покажет паузу.
+          console.error('[player] play() отклонён:', err?.name, err?.message)
+        }
       }
       if (superseded()) return
 
@@ -470,7 +558,10 @@ export function usePlayer() {
     } finally {
       crossfading.current = false    // never wedge the auto-crossfade trigger, even on a throw
     }
-  }, [applyGain, loadInto, preloadAhead, warmUp])
+  }, [applyGain, loadInto, preloadAhead, warmUp, armWatchdog])
+
+  // Ватчдог и обработчик 'error' объявлены выше switchTo, поэтому зовут его через ref.
+  useEffect(() => { switchToRef.current = (pos, seconds) => { void switchTo(pos, seconds) } }, [switchTo])
 
   // Both step from the INTENDED position, not the playing one: during an in-flight
   // switch orderPosRef still holds the old value, so a burst of taps all resolved
@@ -516,6 +607,7 @@ export function usePlayer() {
     const cur = elFor(active.current)
     if (cur && !cur.paused) {
       // Really playing → pause. The native 'pause' event flips the UI.
+      clearWatchdog()          // пауза — не залипание, сторожить нечего
       cur.pause()
       return
     }
@@ -528,18 +620,23 @@ export function usePlayer() {
       const ts = tracksRef.current, ord = orderRef.current
       if (!el.src && ts.length) await loadInto(active.current, ts[ord[orderPosRef.current] ?? 0])
       applyGain(active.current, 1)
+      const attempt = ++attemptSeq.current
+      armWatchdog(active.current, attempt)
       try {
         await el.play()             // normally the UI flips via the 'play' event
       } catch (e) {
+        const err = e as DOMException
         // AbortError = play() interrupted by a quick pause()/reload — harmless.
-        if ((e as DOMException)?.name !== 'AbortError') { /* refused — see below */ }
+        if (err?.name !== 'AbortError') {
+          console.error('[player] play() отклонён:', err?.name, err?.message)
+        }
       }
       // Backstop for the case the event cannot deliver: an element that was ALREADY
       // playing fires no 'play', and a refused play() fires nothing at all. Either
       // way the element knows the truth, so take it from there.
       setIsPlaying(!el.paused)
     })()
-  }, [applyGain, loadInto, warmUp])
+  }, [applyGain, loadInto, warmUp, armWatchdog, clearWatchdog])
 
   // ── per-element events: progress, crossfade trigger, safety net ───────────
   useEffect(() => {
@@ -586,6 +683,37 @@ export function usePlayer() {
       // must never be able to wedge the pause state.
       const onPlay  = () => { if (!warming.current && active.current === side) setIsPlaying(true) }
       const onPause = () => { if (!warming.current && active.current === side) setIsPlaying(false) }
+      // Звук ПОШЁЛ. Только это снимает ватчдог — 'play' недостаточно, он означает
+      // лишь «элемент согласился попробовать».
+      const onPlaying = () => {
+        if (warming.current || active.current !== side) return
+        playingToken.current = attemptSeq.current
+        failStreak.current = 0
+        clearWatchdog()
+      }
+      // Элемент отверг источник: битые байты из кэша, пропавший файл, отказ
+      // декодера. Ждать здесь нечего — ни 'ended', ни 'timeupdate' не придут, и
+      // без этого обработчика плеер молча стоит.
+      const onError = () => {
+        if (disposed.current || active.current !== side) return
+        console.error('[player] источник отвергнут элементом', {
+          side, code: el.error?.code ?? null,
+          src: (el.getAttribute('src') || '').slice(0, 80),
+        })
+        clearWatchdog()
+        failStreak.current++
+        // Байты в кэше могли докачаться битыми — выбрасываем, иначе следующий
+        // круг плейлиста споткнётся о них снова.
+        const t = tracksRef.current[orderRef.current[orderPosRef.current]]
+        if (t) void cache.drop(t.src)
+        if (failStreak.current > MAX_FAIL_STREAK) {
+          console.error(`[player] ${failStreak.current} треков подряд не запустились — останавливаемся`)
+          setIsPlaying(false)
+          setError('Не удаётся воспроизвести треки — проверьте связь с сервером')
+          return
+        }
+        switchToRef.current(intendedPos.current + 1, SWITCH_SEC)
+      }
 
       el.addEventListener('timeupdate', onTime)
       el.addEventListener('durationchange', onDur)
@@ -593,6 +721,8 @@ export function usePlayer() {
       el.addEventListener('play', onPlay)
       el.addEventListener('playing', onPlay)
       el.addEventListener('pause', onPause)
+      el.addEventListener('playing', onPlaying)
+      el.addEventListener('error', onError)
       offs.push(() => {
         el.removeEventListener('timeupdate', onTime)
         el.removeEventListener('durationchange', onDur)
@@ -600,10 +730,12 @@ export function usePlayer() {
         el.removeEventListener('play', onPlay)
         el.removeEventListener('playing', onPlay)
         el.removeEventListener('pause', onPause)
+        el.removeEventListener('playing', onPlaying)
+        el.removeEventListener('error', onError)
       })
     }
     return () => { for (const off of offs) off() }
-  }, [switchTo, user?.username])
+  }, [switchTo, user?.username, clearWatchdog])
 
   // ── lock-screen controls + metadata ───────────────────────────────────────
   useEffect(() => {
